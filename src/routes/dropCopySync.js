@@ -35,7 +35,9 @@ router.post('/sync', validateSyncKey, async (req, res) => {
         } else {
             const positionMap = new Map();
             for (const trade of trades) {
-                const { ucc, symbol, instrument_type, expiry_date, strike_price, option_type, side, quantity, price, lot_size } = trade;
+                const { ucc, symbol, isin, company_name, instrument_type,
+                        expiry_date, strike_price, option_type,
+                        side, quantity, price, lot_size } = trade;
                 if (!ucc || !symbol || !side || !quantity) continue;
                 const qty = parseFloat(quantity) || 0;
                 const px  = parseFloat(price)    || 0;
@@ -48,6 +50,8 @@ router.post('/sync', validateSyncKey, async (req, res) => {
                     positionMap.set(key, {
                         ucc:             ucc.toString().substring(0, 20),
                         symbol:          symbol.trim().substring(0, 50),
+                        isin:            (isin || '').trim().substring(0, 20),
+                        company_name:    (company_name || '').trim().substring(0, 200),
                         instrument_type: (instrument_type || 'EQUITY').substring(0, 20),
                         expiry_date:     expiry_date || null,
                         strike_price:    strike_price ? parseFloat(strike_price) : null,
@@ -64,6 +68,8 @@ router.post('/sync', validateSyncKey, async (req, res) => {
                 positions.push({
                     ucc:             pos.ucc,
                     symbol:          pos.symbol,
+                    isin:            pos.isin,
+                    company_name:    pos.company_name,
                     instrument_type: pos.instrument_type,
                     expiry_date:     pos.expiry_date,
                     strike_price:    pos.strike_price,
@@ -78,12 +84,14 @@ router.post('/sync', validateSyncKey, async (req, res) => {
             }
         }
 
-        // ── Build Table-Valued Parameter ──────────────────────────────────────
+        // ── Build TVP — now includes isin + company_name ──────────────────────
         const tvp = new sql.Table();
         tvp.columns.add('ucc',             sql.VarChar(20));
         tvp.columns.add('exchange',        sql.VarChar(10));
         tvp.columns.add('segment',         sql.VarChar(10));
         tvp.columns.add('symbol',          sql.VarChar(50));
+        tvp.columns.add('isin',            sql.VarChar(20));
+        tvp.columns.add('company_name',    sql.VarChar(200));
         tvp.columns.add('instrument_type', sql.VarChar(20));
         tvp.columns.add('expiry_date',     sql.Date);
         tvp.columns.add('strike_price',    sql.Decimal(10,4));
@@ -103,32 +111,75 @@ router.post('/sync', validateSyncKey, async (req, res) => {
             const avgSellPx = pos.avg_sell_price !== undefined ? pos.avg_sell_price : null;
 
             tvp.rows.add(
-                (pos.ucc || '').toString().substring(0, 20),
+                (pos.ucc          || '').toString().substring(0, 20),
                 exchange.trim(),
                 segment.trim(),
-                (pos.symbol || '').toString().substring(0, 50),
+                (pos.symbol       || '').toString().substring(0, 50),
+                (pos.isin         || '').toString().substring(0, 20),
+                (pos.company_name || '').toString().substring(0, 200),
                 (pos.instrument_type || 'EQUITY').substring(0, 20),
                 pos.expiry_date ? new Date(pos.expiry_date) : null,
-                pos.strike_price || null,
-                pos.option_type  || null,
-                pos.buy_qty      || 0,
-                pos.sell_qty     || 0,
+                pos.strike_price  || null,
+                pos.option_type   || null,
+                pos.buy_qty       || 0,
+                pos.sell_qty      || 0,
                 netQty,
                 avgBuyPx,
                 avgSellPx,
-                pos.lot_size     || 1,
+                pos.lot_size      || 1,
                 new Date(trade_date),
-                file_source      || ''
+                file_source       || ''
             );
         }
 
-        // ── ONE stored procedure call for ALL positions ────────────────────────
+        // ── Bulk upsert day_positions ─────────────────────────────────────────
         await pool.request()
             .input('positions', tvp)
             .execute('usp_BulkUpsertDayPositions');
 
-        console.log('[DropCopy] ' + file_source + ' - ' + positions.length + ' positions bulk upserted');
-        return res.json({ success: true, inserted: positions.length, updated: 0, skipped: 0, total: positions.length });
+        console.log(`[DropCopy] ${file_source} - ${positions.length} positions bulk upserted`);
+
+        // ── Upsert symbol_master for CM (ISIN mapping) ────────────────────────
+        const cmPositions = positions.filter(p =>
+            (p.isin || '').length > 5 &&
+            (p.instrument_type || '').toUpperCase() === 'EQUITY'
+        );
+
+        if (cmPositions.length > 0) {
+            for (const pos of cmPositions) {
+                try {
+                    await pool.request()
+                        .input('isin',        sql.VarChar(20),  pos.isin)
+                        .input('nseSymbol',   sql.VarChar(50),  exchange === 'NSE' ? pos.symbol : null)
+                        .input('bseSymbol',   sql.VarChar(50),  exchange === 'BSE' ? pos.symbol : null)
+                        .input('companyName', sql.VarChar(200), pos.company_name || null)
+                        .query(`
+                            MERGE symbol_master AS target
+                            USING (SELECT @isin AS isin) AS src ON target.isin = src.isin
+                            WHEN MATCHED THEN
+                                UPDATE SET
+                                    nse_symbol   = COALESCE(@nseSymbol, nse_symbol),
+                                    bse_symbol   = COALESCE(@bseSymbol, bse_symbol),
+                                    company_name = COALESCE(@companyName, company_name)
+                            WHEN NOT MATCHED THEN
+                                INSERT (isin, nse_symbol, bse_symbol, company_name)
+                                VALUES (@isin, @nseSymbol, @bseSymbol, @companyName);
+                        `);
+                } catch (smErr) {
+                    // Non-blocking — symbol_master failure doesn't break sync
+                    console.error('[DropCopy] symbol_master upsert error:', smErr.message);
+                }
+            }
+            console.log(`[DropCopy] symbol_master: ${cmPositions.length} ISIN records upserted`);
+        }
+
+        return res.json({
+            success:  true,
+            inserted: positions.length,
+            updated:  0,
+            skipped:  0,
+            total:    positions.length
+        });
 
     } catch (err) {
         console.error('[DropCopy] Sync error:', err.message);
@@ -140,19 +191,17 @@ router.get('/positions', authenticate, async (req, res) => {
     try {
         const pool = await getConnection();
         const ucc  = req.user && req.user.ucc;
-        console.log('[DayPos] UCC:', ucc);
         if (!ucc) return res.status(401).json({ error: 'Unauthorized.' });
 
         const now       = new Date();
         const istDate   = new Date(now.getTime() + (5.5 * 60 * 60 * 1000));
         const tradeDate = istDate.toISOString().slice(0, 10);
-        console.log('[DayPos] trade_date:', tradeDate);
 
         const result = await pool.request()
             .input('ucc',       sql.VarChar(20), ucc.toString().trim())
             .input('tradeDate', sql.Date,        new Date(tradeDate))
             .query(`
-                SELECT id, ucc, exchange, segment, symbol,
+                SELECT id, ucc, exchange, segment, symbol, isin,
                     instrument_type, expiry_date, strike_price,
                     option_type, buy_qty, sell_qty, net_qty,
                     avg_buy_price, avg_sell_price, lot_size,
@@ -162,14 +211,12 @@ router.get('/positions', authenticate, async (req, res) => {
                 ORDER BY instrument_type, symbol
             `);
 
-        console.log('[DayPos] Records found:', result.recordset.length);
         return res.json({
             success:    true,
             positions:  result.recordset,
             total:      result.recordset.length,
             trade_date: tradeDate
         });
-
     } catch (err) {
         console.error('[DayPos] Error:', err.message);
         return res.status(500).json({ error: 'Failed to fetch day positions.' });
@@ -195,7 +242,6 @@ router.get('/status', async (req, res) => {
     }
 });
 
-// ── POST /api/dropcopy/log ────────────────────────────────────────────────────
 router.post('/log', validateSyncKey, async (req, res) => {
     const { file_source, exchange, segment, status, trades_count,
             positions_count, sync_duration_ms, error_message,
@@ -229,7 +275,6 @@ router.post('/log', validateSyncKey, async (req, res) => {
     }
 });
 
-// ── GET /api/dropcopy/sync-logs ───────────────────────────────────────────────
 router.get('/sync-logs', async (req, res) => {
     const key = req.headers['x-sync-key'] || req.query.key;
     if (!key || key !== process.env.SYNC_API_KEY) {
@@ -246,22 +291,10 @@ router.get('/sync-logs', async (req, res) => {
             FROM sync_logs
             WHERE 1=1
         `;
-        if (req.query.date_from) {
-            query += ' AND CAST(log_time AS DATE) >= @dateFrom';
-            request.input('dateFrom', sql.Date, req.query.date_from);
-        }
-        if (req.query.date_to) {
-            query += ' AND CAST(log_time AS DATE) <= @dateTo';
-            request.input('dateTo', sql.Date, req.query.date_to);
-        }
-        if (req.query.exchange && req.query.exchange !== 'ALL') {
-            query += ' AND exchange = @exchange';
-            request.input('exchange', sql.VarChar(10), req.query.exchange);
-        }
-        if (req.query.status && req.query.status !== 'ALL') {
-            query += ' AND status = @status';
-            request.input('status', sql.VarChar(20), req.query.status);
-        }
+        if (req.query.date_from) { query += ' AND CAST(log_time AS DATE) >= @dateFrom'; request.input('dateFrom', sql.Date, req.query.date_from); }
+        if (req.query.date_to)   { query += ' AND CAST(log_time AS DATE) <= @dateTo';   request.input('dateTo',   sql.Date, req.query.date_to);   }
+        if (req.query.exchange && req.query.exchange !== 'ALL') { query += ' AND exchange = @exchange'; request.input('exchange', sql.VarChar(10), req.query.exchange); }
+        if (req.query.status   && req.query.status   !== 'ALL') { query += ' AND status = @status';    request.input('status',   sql.VarChar(20), req.query.status);   }
         query += ' ORDER BY log_time DESC';
         const result = await request.query(query);
         return res.json({ success: true, logs: result.recordset });
@@ -270,7 +303,6 @@ router.get('/sync-logs', async (req, res) => {
     }
 });
 
-// POST /api/dropcopy/refresh-lots — called by sync service after each successful sync
 router.post('/refresh-lots', async (req, res) => {
     const key = req.headers['x-sync-key'] || req.query.key;
     if (!key || key !== process.env.SYNC_API_KEY)
@@ -285,23 +317,20 @@ router.post('/refresh-lots', async (req, res) => {
                     SELECT symbol, exchange, lot_size,
                            ROW_NUMBER() OVER (PARTITION BY symbol, exchange ORDER BY trade_date DESC) AS rn
                     FROM day_positions
-                    WHERE lot_size > 1
-                    AND trade_date = CAST(GETDATE() AS DATE)
+                    WHERE lot_size > 1 AND trade_date = CAST(GETDATE() AS DATE)
                 ) t WHERE rn = 1
             ) AS src
             ON target.symbol = src.symbol AND target.exchange = src.exchange
             WHEN MATCHED AND src.lot_size > 1 THEN
                 UPDATE SET lot_size = src.lot_size, updated_at = GETDATE()
             WHEN NOT MATCHED THEN
-                INSERT (symbol, exchange, lot_size)
-                VALUES (src.symbol, src.exchange, src.lot_size);
-
+                INSERT (symbol, exchange, lot_size) VALUES (src.symbol, src.exchange, src.lot_size);
             SELECT @@ROWCOUNT AS rows_affected;
         `);
         return res.json({ success: true, rows_affected: result.recordset[0]?.rows_affected });
     } catch (err) {
-        console.error('Refresh lots error:', err);
         return res.status(500).json({ error: err.message });
     }
 });
+
 module.exports = router;

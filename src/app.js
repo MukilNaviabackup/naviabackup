@@ -122,12 +122,17 @@ app.use((err, req, res, next) => {
     res.status(500).json({ error: 'Something went wrong. Please try again.' });
 });
 
+// ── Start reconciliation service ─────────────────────────────────────────────
+const { startReconciliationService } = require('./services/reconciliationService');
+
 // ── Start server ──────────────────────────────────────────────────────────────
 const PORT   = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
     console.log(`\nNavia Backup API  →  http://localhost:${PORT}`);
     console.log(`Environment       →  ${process.env.NODE_ENV || 'production'}`);
     console.log(`Health check      →  http://localhost:${PORT}/health\n`);
+    // Start trade reconciliation engine
+    startReconciliationService();
     server.timeout         = 300000; // 5 minutes
     server.keepAliveTimeout = 305000;
     server.headersTimeout  = 310000;
