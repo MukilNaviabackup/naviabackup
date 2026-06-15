@@ -1,0 +1,80 @@
+name: Deploy Navia Backup to Azure
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+
+      - name: Install dependencies
+        run: npm install --production
+
+      - name: Create env file
+        run: |
+          echo "DB_SERVER=${{ secrets.DB_SERVER }}" >> .env
+          echo "DB_NAME=${{ secrets.DB_NAME }}" >> .env
+          echo "DB_USER=${{ secrets.DB_USER }}" >> .env
+          echo "DB_PASSWORD=${{ secrets.DB_PASSWORD }}" >> .env
+          echo "JWT_SECRET=${{ secrets.JWT_SECRET }}" >> .env
+          echo "PORT=8080" >> .env
+          echo "SMARTPING_USERNAME=${{ secrets.SMARTPING_USERNAME }}" >> .env
+          echo "SMARTPING_PASSWORD=${{ secrets.SMARTPING_PASSWORD }}" >> .env
+          echo "SMARTPING_SENDER_ID=${{ secrets.SMARTPING_SENDER_ID }}" >> .env
+          echo "SMARTPING_ENTITY_ID=${{ secrets.SMARTPING_ENTITY_ID }}" >> .env
+          echo "SMARTPING_CONTENT_ID=${{ secrets.SMARTPING_CONTENT_ID }}" >> .env
+          echo "SMTP_HOST=${{ secrets.SMTP_HOST }}" >> .env
+          echo "SMTP_PORT=${{ secrets.SMTP_PORT }}" >> .env
+          echo "SMTP_USER=${{ secrets.SMTP_USER }}" >> .env
+          echo "SMTP_PASSWORD=${{ secrets.SMTP_PASSWORD }}" >> .env
+          echo "SMTP_FROM=${{ secrets.SMTP_FROM }}" >> .env
+          echo "SYNC_API_KEY=${{ secrets.SYNC_API_KEY }}" >> .env
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Create deployment zip
+        run: |
+          zip -r deploy.zip . \
+            --exclude=".git/*" \
+            --exclude=".github/*" \
+            --exclude="*.md"
+          echo "Zip created successfully"
+          ls -la deploy.zip
+          
+      - name: Deploy to Azure
+        run: |
+          az webapp deploy \
+            --resource-group navia-backup-rg \
+            --name naviabackup-app \
+            --src-path deploy.zip \
+            --type zip
+
+      - name: Set startup command
+        run: |
+          az webapp config set \
+            --resource-group navia-backup-rg \
+            --name naviabackup-app \
+            --startup-file "node src/app.js"
+
+      - name: Restart app
+        run: |
+          az webapp restart \
+            --resource-group navia-backup-rg \
+            --name naviabackup-app

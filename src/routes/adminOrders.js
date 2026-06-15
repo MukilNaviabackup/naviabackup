@@ -1,0 +1,482 @@
+const express = require('express');
+const router = express.Router();
+const { getConnection, sql } = require('../config/database');
+const { adminAuthenticate } = require('../middleware/adminAuthenticate');
+const nodemailer = require('nodemailer');
+require('dotenv').config();
+
+function createTransporter() {
+    return nodemailer.createTransport({
+        host: process.env.SMTP_HOST || 'smtp.zatpatmail.com',
+        port: 465, secure: true,
+        auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASSWORD },
+        tls: { rejectUnauthorized: false }
+    });
+}
+
+// ── NEAT/BOLT file row builders ───────────────────────────────────────────────
+// NSE NEAT CM Basket — 19 fixed-width comma-separated columns
+// Verified against accepted NEAT terminal file 10-Jun-2026
+function makeNeatCMRow(serial, side, symbol, qty, ucc, memberCode) {
+    const trans = side.toUpperCase() === 'BUY' ? '1' : '2';
+    return [
+        String(serial).padEnd(13),   // Col 0: Serial No
+        '1 ',                         // Col 1: Order Flow = 1 (Normal) — ALWAYS 1, never 2
+        trans + ' ',                  // Col 2: Transaction 1=Buy 2=Sell
+        symbol.padEnd(10),           // Col 3: Symbol padded to 10
+        'EQ',                         // Col 4: Series — NO trailing spaces
+        String(qty) + ' ',           // Col 5: Quantity
+        '           ',               // Col 6: Price (blank, 11 chars)
+        '  ',                         // Col 7: Stop Loss (blank)
+        '         ',                 // Col 8: Disc Qty (blank)
+        'MKT       ',                // Col 9: Order Type MKT
+        '        ',                  // Col 10: Price Condition (blank)
+        '1        ',                 // Col 11: Fill/Kill = 1
+        '         ',                 // Col 12: Participant (blank)
+        memberCode.padEnd(12),       // Col 13: Member Code (07708)
+        '2 ',                         // Col 14: Client Type = 2
+        ucc.padEnd(10),              // Col 15: Client Code (UCC)
+        '                         ', // Col 16: Account (blank)
+        '                ',          // Col 17: Exchange Reference (blank)
+        '          ',                // Col 18: Text (blank)
+    ].join(',');
+}
+
+// NSE NEAT FO Basket — options and futures
+function makeNeatFORow(serial, side, symbol, expiry, strikePrice, optionType, qty, ucc, memberCode) {
+    const trans   = side.toUpperCase() === 'BUY' ? '1' : '2';
+    const expStr  = expiry
+        ? new Date(expiry).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: '2-digit' })
+            .toUpperCase().replace(/ /g, '-')
+        : '          ';
+    const strike  = strikePrice ? String(parseFloat(strikePrice).toFixed(2)).padEnd(12) : '            ';
+    // NEAT uses CA (Call) / PA (Put) not CE/PE
+    const optType = optionType
+        ? (optionType === 'CE' ? 'CA' : 'PA').padEnd(4)
+        : 'XX  ';
+    return [
+        String(serial).padEnd(13),
+        '1 ',
+        trans + ' ',
+        symbol.padEnd(10),
+        expStr.padEnd(10),
+        strike,
+        optType,
+        String(qty) + ' ',
+        '           ',
+        'MKT       ',
+        '        ',
+        '1        ',
+        '         ',
+        memberCode.padEnd(12),
+        '2 ',
+        ucc.padEnd(10),
+        '                         ',
+        '                ',
+        '          ',
+    ].join(',');
+}
+
+// BSE BOLT CM format
+function makeBoltCMRow(serial, side, symbol, qty, ucc, memberCode) {
+    const trans = side.toUpperCase() === 'BUY' ? '1' : '2';
+    return [
+        String(serial).padEnd(13),
+        '1 ',
+        trans + ' ',
+        symbol.padEnd(10),
+        'A ',
+        String(qty) + ' ',
+        '           ',
+        '  ',
+        '         ',
+        'MKT       ',
+        '        ',
+        '1        ',
+        '         ',
+        memberCode.padEnd(12),
+        '2 ',
+        ucc.padEnd(10),
+        '                         ',
+        '                ',
+        '          ',
+    ].join(',');
+}
+
+// BSE BOLT FO format
+function makeBoltFORow(serial, side, symbol, expiry, strikePrice, optionType, qty, ucc, memberCode) {
+    const trans  = side.toUpperCase() === 'BUY' ? '1' : '2';
+    const expStr = expiry
+        ? new Date(expiry).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: '2-digit' })
+            .toUpperCase().replace(/ /g, '-')
+        : '          ';
+    const strike = strikePrice ? String(parseFloat(strikePrice).toFixed(2)).padEnd(12) : '            ';
+    const optType = optionType ? (optionType === 'CE' ? 'CE' : 'PE').padEnd(4) : 'XX  ';
+    return [
+        String(serial).padEnd(13),
+        '1 ',
+        trans + ' ',
+        symbol.padEnd(10),
+        expStr.padEnd(10),
+        strike,
+        optType,
+        String(qty) + ' ',
+        '           ',
+        'MKT       ',
+        '        ',
+        '1        ',
+        '         ',
+        memberCode.padEnd(12),
+        '2 ',
+        ucc.padEnd(10),
+        '                         ',
+        '                ',
+        '          ',
+    ].join(',');
+}
+
+// MCX CTCL basket format
+function makeMCXRow(serial, side, symbol, expiry, qty, ucc, memberCode) {
+    const trans  = side.toUpperCase() === 'BUY' ? '1' : '2';
+    const expStr = expiry
+        ? new Date(expiry).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: '2-digit' })
+            .toUpperCase().replace(/ /g, '-')
+        : '          ';
+    return [
+        String(serial).padEnd(13),
+        '1 ',
+        trans + ' ',
+        symbol.padEnd(10),
+        expStr.padEnd(10),
+        '            ',
+        'XX  ',
+        String(qty) + ' ',
+        '           ',
+        'MKT       ',
+        '        ',
+        '1        ',
+        '         ',
+        memberCode.padEnd(12),
+        '2 ',
+        ucc.padEnd(10),
+        '                         ',
+        '                ',
+        '          ',
+    ].join(',');
+}
+
+// Helper: generate filename like BasketCM09Jun2026-12-26-50
+function basketFilename(prefix) {
+    const now = new Date();
+    const dd  = String(now.getDate()).padStart(2, '0');
+    const mon = now.toLocaleString('en-IN', { month: 'short' });
+    const yr  = now.getFullYear();
+    const hh  = String(now.getHours()).padStart(2, '0');
+    const mm  = String(now.getMinutes()).padStart(2, '0');
+    const ss  = String(now.getSeconds()).padStart(2, '0');
+    return `${prefix}${dd}${mon}${yr}-${hh}-${mm}-${ss}.csv`;
+}
+
+// Get all sq-off orders with filters
+router.get('/orders', adminAuthenticate, async (req, res) => {
+    const { exchange, segment, status, date_from, date_to, ucc, placed_by } = req.query;
+    try {
+        const pool = await getConnection();
+        let query = `
+            SELECT 
+                o.order_id, o.ucc, c.client_name, o.exchange, o.segment,
+                o.symbol, o.side, o.quantity, o.order_type, o.status,
+                o.placed_at, o.traded_at, o.trade_price,
+                o.placed_by, o.dealer_id, o.expiry_date,
+                o.strike_price, o.option_type,
+                o.file_generated, o.file_generated_at, o.alert_sent
+            FROM squareoff_orders o
+            LEFT JOIN clients c ON o.ucc = c.ucc
+            WHERE 1=1
+        `;
+        const request = pool.request();
+        if (ucc)      { query += ' AND o.ucc = @ucc';             request.input('ucc',       sql.VarChar, ucc.trim()); }
+        if (exchange) { query += ' AND o.exchange = @exchange';   request.input('exchange',  sql.VarChar, exchange.toUpperCase()); }
+        if (segment)  { query += ' AND o.segment = @segment';    request.input('segment',   sql.VarChar, segment.toUpperCase()); }
+        if (status)   { query += ' AND o.status = @status';      request.input('status',    sql.VarChar, status); }
+        if (placed_by){ query += ' AND o.placed_by = @placedBy'; request.input('placedBy',  sql.VarChar, placed_by.toUpperCase()); }
+        if (date_from){ query += ' AND CAST(o.placed_at AS DATE) >= @date_from'; request.input('date_from', sql.Date, date_from); }
+        if (date_to)  { query += ' AND CAST(o.placed_at AS DATE) <= @date_to';   request.input('date_to',   sql.Date, date_to); }
+        query += ' ORDER BY o.placed_at DESC';
+        const result = await request.query(query);
+        return res.json({ success: true, orders: result.recordset, count: result.recordset.length });
+    } catch (err) {
+        console.error('Get orders error:', err);
+        return res.status(500).json({ error: 'Failed to fetch orders.' });
+    }
+});
+
+// Update order status
+router.post('/orders/update-status', adminAuthenticate, async (req, res) => {
+    const { order_id, status, trade_price } = req.body;
+    if (!order_id || !status) return res.status(400).json({ error: 'order_id and status required.' });
+    try {
+        const pool = await getConnection();
+        await pool.request()
+            .input('orderId',    sql.VarChar,  order_id)
+            .input('status',     sql.VarChar,  status)
+            .input('tradePrice', sql.Decimal,  trade_price || null)
+            .input('tradedAt',   sql.DateTime, status === 'ORDER_TRADED' ? new Date() : null)
+            .query(`UPDATE squareoff_orders SET
+                status = @status,
+                trade_price = CASE WHEN @tradePrice IS NOT NULL THEN @tradePrice ELSE trade_price END,
+                traded_at   = CASE WHEN @tradedAt   IS NOT NULL THEN @tradedAt   ELSE traded_at   END
+                WHERE order_id = @orderId`);
+        return res.json({ success: true, message: 'Status updated.' });
+    } catch (err) {
+        return res.status(500).json({ error: 'Failed to update status.' });
+    }
+});
+
+// Mark file as generated for selected orders
+router.post('/orders/mark-file-generated', adminAuthenticate, async (req, res) => {
+    const { order_ids } = req.body;
+    if (!order_ids || !order_ids.length) return res.status(400).json({ error: 'No orders selected.' });
+    try {
+        const pool   = await getConnection();
+        const idList = order_ids.map(id => `'${id}'`).join(',');
+        await pool.request().query(`
+            UPDATE squareoff_orders 
+            SET file_generated = 1, file_generated_at = GETDATE(), status = 'FILE_GENERATED'
+            WHERE order_id IN (${idList}) AND status = 'ORDER_RECEIVED'
+        `);
+        return res.json({ success: true, message: 'Marked as file generated.' });
+    } catch (err) {
+        return res.status(500).json({ error: 'Failed to update.' });
+    }
+});
+
+// Generate exchange basket file for selected orders
+router.post('/orders/generate-file', adminAuthenticate, async (req, res) => {
+    const { order_ids, exchange } = req.body;
+    if (!order_ids || !order_ids.length) return res.status(400).json({ error: 'No orders selected.' });
+    try {
+        const pool   = await getConnection();
+        const idList = order_ids.map(id => `'${id}'`).join(',');
+        const result = await pool.request().query(`
+            SELECT o.*, c.client_name
+            FROM squareoff_orders o
+            LEFT JOIN clients c ON o.ucc = c.ucc
+            WHERE o.order_id IN (${idList})
+            ORDER BY o.placed_at
+        `);
+        const orders = result.recordset;
+        let csvRows  = [];
+        let filename = '';
+
+        if (exchange === 'NSE') {
+            const cmOrders = orders.filter(o => o.segment === 'CM');
+            const foOrders = orders.filter(o => o.segment === 'FO');
+
+            if (cmOrders.length > 0 && foOrders.length === 0) {
+                filename = basketFilename('BasketCM');
+                cmOrders.forEach((o, i) => {
+                    csvRows.push(makeNeatCMRow(i + 1, o.side, o.symbol, o.quantity, o.ucc, '07708'));
+                });
+            } else if (foOrders.length > 0 && cmOrders.length === 0) {
+                filename = basketFilename('BasketFO');
+                foOrders.forEach((o, i) => {
+                    csvRows.push(makeNeatFORow(i + 1, o.side, o.symbol, o.expiry_date, o.strike_price, o.option_type, o.quantity, o.ucc, '07708'));
+                });
+            } else {
+                // Mixed CM+FO — separate into two files; send CM as primary download
+                filename = basketFilename('BasketCM');
+                let serial = 1;
+                cmOrders.forEach(o => {
+                    csvRows.push(makeNeatCMRow(serial++, o.side, o.symbol, o.quantity, o.ucc, '07708'));
+                });
+                // FO rows appended after CM
+                foOrders.forEach(o => {
+                    csvRows.push(makeNeatFORow(serial++, o.side, o.symbol, o.expiry_date, o.strike_price, o.option_type, o.quantity, o.ucc, '07708'));
+                });
+            }
+        } else if (exchange === 'BSE') {
+            const cmOrders = orders.filter(o => o.segment === 'CM');
+            const foOrders = orders.filter(o => o.segment === 'FO');
+            filename = basketFilename('BasketBSE');
+            let serial = 1;
+            cmOrders.forEach(o => {
+                csvRows.push(makeBoltCMRow(serial++, o.side, o.symbol, o.quantity, o.ucc, '6341'));
+            });
+            foOrders.forEach(o => {
+                csvRows.push(makeBoltFORow(serial++, o.side, o.symbol, o.expiry_date, o.strike_price, o.option_type, o.quantity, o.ucc, '6341'));
+            });
+        } else if (exchange === 'MCX') {
+            filename = basketFilename('BasketMCX');
+            orders.forEach((o, i) => {
+                csvRows.push(makeMCXRow(i + 1, o.side, o.symbol, o.expiry_date, o.quantity, o.ucc, '45345'));
+            });
+        } else {
+            // Generic report (record-keeping only — not for terminal upload)
+            filename = `SQOFF_REPORT_${new Date().toISOString().slice(0,10)}.csv`;
+            csvRows.push(['UCC','ClientName','PlacedOn','Symbol','Exchange','Segment','ExpiryDate','StrikePrice','OptionType','B/S','Qty','Status','PlacedBy','FileGenerated'].join(','));
+            orders.forEach(o => {
+                csvRows.push([
+                    o.ucc, o.client_name||'',
+                    new Date(o.placed_at).toLocaleDateString('en-IN'),
+                    o.symbol, o.exchange, o.segment,
+                    o.expiry_date ? new Date(o.expiry_date).toLocaleDateString('en-IN') : '',
+                    o.strike_price||'', o.option_type||'',
+                    o.side, o.quantity, o.status, o.placed_by||'CLIENT',
+                    o.file_generated ? 'YES' : 'NO'
+                ].join(','));
+            });
+        }
+
+        const csvContent = csvRows.join('\n');
+
+        // Mark orders as file generated
+        await pool.request().query(`
+            UPDATE squareoff_orders 
+            SET file_generated = 1, file_generated_at = GETDATE(), status = 'FILE_GENERATED'
+            WHERE order_id IN (${idList}) AND status = 'ORDER_RECEIVED'
+        `);
+
+        // Send admin alert email with file attached
+        try {
+            const transporter = createTransporter();
+            await transporter.sendMail({
+                from: `"Navia RMS" <${process.env.SMTP_FROM || 'updates@navia.co.in'}>`,
+                to: process.env.ADMIN_ALERT_EMAIL || 'support@navia.co.in',
+                subject: `[NAVIA BACKUP] Sq-Off File Generated — ${exchange} — ${orders.length} Orders`,
+                html: `<div style="font-family:Arial,sans-serif">
+                    <h3>Navia Backup — Sq-Off Basket File</h3>
+                    <p>Exchange: <strong>${exchange}</strong> | Orders: <strong>${orders.length}</strong> | Generated: ${new Date().toLocaleString('en-IN')}</p>
+                    <p>File attached: <code>${filename}</code></p>
+                    <p style="color:#dc2626;font-size:12px">Upload this file directly to the ${exchange} terminal. Do not modify.</p>
+                </div>`,
+                attachments: [{ filename, content: csvContent, contentType: 'text/csv' }]
+            });
+        } catch (emailErr) {
+            console.error('Admin alert email error:', emailErr.message);
+        }
+
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        return res.send(csvContent);
+
+    } catch (err) {
+        console.error('Generate file error:', err);
+        return res.status(500).json({ error: 'Failed to generate file.' });
+    }
+});
+
+// Get order summary stats
+router.get('/orders/stats', adminAuthenticate, async (req, res) => {
+    try {
+        const pool = await getConnection();
+        const result = await pool.request().query(`
+            SELECT 
+                COUNT(*) as total,
+                SUM(CASE WHEN status = 'ORDER_RECEIVED' THEN 1 ELSE 0 END) as received,
+                SUM(CASE WHEN status = 'FILE_GENERATED' THEN 1 ELSE 0 END) as file_generated,
+                SUM(CASE WHEN status = 'ORDER_TRADED'   THEN 1 ELSE 0 END) as traded,
+                SUM(CASE WHEN CAST(placed_at AS DATE) = CAST(GETDATE() AS DATE) THEN 1 ELSE 0 END) as today
+            FROM squareoff_orders
+        `);
+        return res.json({ success: true, stats: result.recordset[0] });
+    } catch (err) {
+        return res.status(500).json({ error: 'Failed to fetch stats.' });
+    }
+});
+
+// Create new dealer
+router.post('/dealers/create', adminAuthenticate, async (req, res) => {
+    const { dealer_id, full_name, email, mobile } = req.body;
+    if (!dealer_id || !full_name || !email) return res.status(400).json({ error: 'Dealer ID, name and email are required.' });
+    try {
+        const pool = await getConnection();
+        await pool.request()
+            .input('dealerId',  sql.VarChar(10),  dealer_id.toUpperCase().trim())
+            .input('fullName',  sql.VarChar(200), full_name.trim())
+            .input('email',     sql.VarChar(100), email.trim())
+            .input('mobile',    sql.VarChar(15),  mobile || null)
+            .input('createdBy', sql.Int,          req.admin.adminId)
+            .query(`INSERT INTO dealers (dealer_id, full_name, email, mobile, is_active, created_by)
+                    VALUES (@dealerId, @fullName, @email, @mobile, 1, @createdBy)`);
+        return res.json({ success: true, message: `Dealer ${dealer_id} created successfully.` });
+    } catch (err) {
+        if (err.message.includes('PRIMARY KEY')) return res.status(400).json({ error: `Dealer ID ${dealer_id} already exists.` });
+        return res.status(500).json({ error: 'Failed to create dealer.' });
+    }
+});
+
+// Get all admin users
+router.get('/users', adminAuthenticate, async (req, res) => {
+    try {
+        const pool = await getConnection();
+        const result = await pool.request()
+            .query('SELECT admin_id, username, email, full_name, role, is_active, created_at, last_login FROM admin_users ORDER BY admin_id');
+        return res.json({ success: true, users: result.recordset });
+    } catch (err) { return res.status(500).json({ error: 'Failed to fetch users.' }); }
+});
+
+// Create new admin user
+router.post('/users/create', adminAuthenticate, async (req, res) => {
+    const { username, email, full_name, role } = req.body;
+    if (!username || !email || !full_name) return res.status(400).json({ error: 'Username, email and full name are required.' });
+    try {
+        const pool = await getConnection();
+        await pool.request()
+            .input('username', sql.VarChar(50),  username.toLowerCase().trim())
+            .input('email',    sql.VarChar(100), email.trim())
+            .input('fullName', sql.VarChar(200), full_name.trim())
+            .input('role',     sql.VarChar(20),  role || 'SUBUSER')
+            .query(`INSERT INTO admin_users (username, email, full_name, role, is_active) VALUES (@username, @email, @fullName, @role, 1)`);
+        return res.json({ success: true, message: `User ${username} created successfully.` });
+    } catch (err) {
+        if (err.message.includes('UNIQUE') || err.message.includes('unique')) return res.status(400).json({ error: `Username "${username}" already exists.` });
+        return res.status(500).json({ error: 'Failed to create user.' });
+    }
+});
+
+// Toggle admin user status
+router.post('/users/toggle', adminAuthenticate, async (req, res) => {
+    const { admin_id, is_active } = req.body;
+    try {
+        const pool = await getConnection();
+        await pool.request()
+            .input('adminId',  sql.Int, admin_id)
+            .input('isActive', sql.Bit, is_active ? 1 : 0)
+            .query('UPDATE admin_users SET is_active = @isActive WHERE admin_id = @adminId');
+        return res.json({ success: true });
+    } catch (err) { return res.status(500).json({ error: 'Failed to update user.' }); }
+});
+
+// Get all dealers
+router.get('/dealers', adminAuthenticate, async (req, res) => {
+    try {
+        const pool = await getConnection();
+        const result = await pool.request().query('SELECT * FROM dealers ORDER BY dealer_id');
+        return res.json({ success: true, dealers: result.recordset });
+    } catch (err) { return res.status(500).json({ error: 'Failed to fetch dealers.' }); }
+});
+
+// Toggle dealer status
+router.post('/dealers/toggle', adminAuthenticate, async (req, res) => {
+    const { dealer_id, is_active } = req.body;
+    try {
+        const pool = await getConnection();
+        await pool.request()
+            .input('dealerId', sql.VarChar(10), dealer_id)
+            .input('isActive', sql.Bit, is_active ? 1 : 0)
+            .query('UPDATE dealers SET is_active = @isActive WHERE dealer_id = @dealerId');
+        return res.json({ success: true });
+    } catch (err) { return res.status(500).json({ error: 'Failed to update dealer.' }); }
+});
+
+// Get dealer logs
+router.get('/dealer-logs', adminAuthenticate, async (req, res) => {
+    try {
+        const pool = await getConnection();
+        const result = await pool.request().query('SELECT * FROM dealer_logs ORDER BY created_at DESC');
+        return res.json({ success: true, logs: result.recordset });
+    } catch (err) { return res.status(500).json({ error: 'Failed to fetch dealer logs.' }); }
+});
+
+module.exports = router;
