@@ -7,6 +7,16 @@ const nodemailer = require('nodemailer');
 const { getConnection, sql } = require('../config/database');
 require('dotenv').config();
 
+// ── IST end-of-day helper ─────────────────────────────────────────────────────
+function getISTEndOfDay() {
+    const nowIST = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+    const eodUTC = new Date(Date.UTC(
+        nowIST.getUTCFullYear(), nowIST.getUTCMonth(), nowIST.getUTCDate(),
+        18, 29, 59, 0  // 23:59:59 IST
+    ));
+    return eodUTC > new Date() ? eodUTC : new Date(eodUTC.getTime() + 24*60*60*1000);
+}
+
 /* ── Fire-and-forget system log writer ───────────────────────────────────────*/
 function writeLog(logType, actor, actorType, ucc, ip, details, status) {
     setImmediate(async () => {
@@ -86,7 +96,7 @@ router.post('/login/initiate', async (req, res) => {
         const otp       = Math.floor(100000 + Math.random() * 900000).toString();
         const otpHash   = await bcrypt.hash(otp, 10);
         const sessionId = uuidv4();
-        const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+        const expiresAt = getISTEndOfDay(); // Expires 23:59:59 IST today
 
         await pool.request()
             .input('sessionId', sql.VarChar(36), sessionId)
@@ -138,9 +148,11 @@ router.post('/login/verify-otp', async (req, res) => {
         await pool.request().input('dealerId', sql.VarChar(10), dealerIdValue)
             .query('UPDATE dealers SET last_login=GETDATE() WHERE dealer_id=@dealerId');
 
+        const eodDealer  = getISTEndOfDay();
+        const secsTilEOD = Math.max(60, Math.floor((eodDealer - Date.now()) / 1000));
         const token = jwt.sign(
             { dealerId: dealerIdValue, name: session.full_name, role: 'DEALER' },
-            process.env.JWT_SECRET, { expiresIn: '24h' }
+            process.env.JWT_SECRET, { expiresIn: secsTilEOD }
         );
 
         writeLog('DEALER_LOGIN_SUCCESS', session.full_name, 'DEALER', null, ip, `Dealer ${dealerIdValue} logged in`, 'SUCCESS');
@@ -225,5 +237,214 @@ router.get('/logs', async (req, res) => {
         return res.json({ success: true, logs: result.recordset });
     } catch { return res.status(500).json({ error: 'Failed to fetch logs.' }); }
 });
+
+
+// ── GET /api/dealer/recent-clients ───────────────────────────────────────────
+// Fetch dealer's recent client access from dealer_logs (persistent across sessions)
+router.get('/recent-clients', async (req, res) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Unauthorized.' });
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        if (!decoded.dealerId) return res.status(401).json({ error: 'Invalid dealer token.' });
+        const pool = await getConnection();
+        const result = await pool.request()
+            .input('dealerId', sql.VarChar(10), String(decoded.dealerId).trim())
+            .query(`
+                SELECT DISTINCT TOP 10
+                    dl.ucc,
+                    c.client_name,
+                    MAX(dl.created_at) AS last_accessed
+                FROM dealer_logs dl
+                LEFT JOIN clients c ON dl.ucc = c.ucc
+                WHERE dl.dealer_id = @dealerId
+                AND dl.ucc IS NOT NULL
+                GROUP BY dl.ucc, c.client_name
+                ORDER BY last_accessed DESC
+            `);
+        return res.json({ success: true, clients: result.recordset });
+    } catch (err) {
+        if (err.name === 'TokenExpiredError') return res.status(401).json({ error: 'Session expired.' });
+        return res.status(500).json({ error: 'Failed to fetch recent clients.' });
+    }
+});
+
+// ── POST /api/dealer/client-data ─────────────────────────────────────────────
+// Securely load client data within dealer session (replaces SSO new-tab flow)
+// Returns positions, orders, BF from DB — squareoff state always from server
+router.post('/client-data', async (req, res) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Unauthorized.' });
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        if (!decoded.dealerId) return res.status(401).json({ error: 'Invalid dealer token.' });
+
+        const { ucc } = req.body;
+        if (!ucc) return res.status(400).json({ error: 'UCC is required.' });
+
+        const pool = await getConnection();
+
+        // Verify client exists and is active
+        const clientResult = await pool.request()
+            .input('ucc', sql.VarChar(20), ucc.trim())
+            .query(`SELECT ucc, client_name, mobile, email,
+                           nse_cm, nse_fo, bse_cm, bse_fo, mcx_fo
+                    FROM clients WHERE ucc = @ucc AND is_active = 1`);
+
+        if (clientResult.recordset.length === 0) {
+            return res.status(404).json({ error: 'Client UCC not found or inactive.' });
+        }
+
+        const client = clientResult.recordset[0];
+
+        // Fetch all data in parallel
+        const now       = new Date();
+        const istDate   = new Date(now.getTime() + 5.5 * 60 * 60 * 1000);
+        const tradeDate = istDate.toISOString().slice(0, 10);
+
+        const [positions, orders, dayPos, bfPos] = await Promise.all([
+            // Broker positions
+            pool.request().input('ucc', sql.VarChar(20), ucc.trim())
+                .query(`SELECT * FROM positions WHERE ucc = @ucc ORDER BY symbol`),
+            // Sq-off orders — source of truth for squareoff_placed state
+            pool.request().input('ucc', sql.VarChar(20), ucc.trim())
+                .query(`SELECT order_id, ucc, exchange, segment, symbol,
+                               quantity, executed_qty, remaining_qty,
+                               side, status, placed_at, placed_by, dealer_id,
+                               expiry_date, strike_price, option_type
+                        FROM squareoff_orders
+                        WHERE ucc = @ucc
+                        ORDER BY placed_at DESC`),
+            // Day positions from DropCopy
+            pool.request()
+                .input('ucc', sql.VarChar(20), ucc.trim())
+                .input('tradeDate', sql.Date, new Date(tradeDate))
+                .query(`SELECT * FROM day_positions
+                        WHERE ucc = @ucc AND trade_date = @tradeDate
+                        ORDER BY instrument_type, symbol`),
+            // B/F positions
+            pool.request().input('ucc', sql.VarChar(20), ucc.trim())
+                .query(`SELECT * FROM bf_positions
+                        WHERE ucc = @ucc
+                        AND biz_date = (SELECT MAX(biz_date) FROM bf_positions WHERE ucc = @ucc)
+                        ORDER BY instrument_type, symbol`)
+        ]);
+
+        // Log dealer access
+        await pool.request()
+            .input('dealerId', sql.VarChar(10), String(decoded.dealerId).trim())
+            .input('ucc',      sql.VarChar(20), ucc.trim())
+            .input('action',   sql.VarChar(100), 'CLIENT_DATA_ACCESSED')
+            .input('details',  sql.VarChar(500), `Dealer ${decoded.dealerId} accessed client ${ucc} data`)
+            .query(`INSERT INTO dealer_logs (dealer_id, ucc, action, details)
+                    VALUES (@dealerId, @ucc, @action, @details)`);
+
+        return res.json({
+            success:       true,
+            client,
+            dealerId:      decoded.dealerId,
+            positions:     positions.recordset,
+            orders:        orders.recordset,
+            day_positions: dayPos.recordset,
+            bf_positions:  bfPos.recordset,
+            trade_date:    tradeDate
+        });
+
+    } catch (err) {
+        console.error('Dealer client-data error:', err);
+        if (err.name === 'TokenExpiredError') return res.status(401).json({ error: 'Session expired. Please login again.' });
+        return res.status(500).json({ error: 'Failed to load client data.' });
+    }
+});
+
+// ── POST /api/dealer/place-squareoff ─────────────────────────────────────────
+// Place sq-off on behalf of client (dealer session, same page)
+router.post('/place-squareoff', async (req, res) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Unauthorized.' });
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        if (!decoded.dealerId) return res.status(401).json({ error: 'Invalid dealer token.' });
+
+        const { ucc, exchange, segment, symbol, quantity, side,
+                expiry_date, strike_price, option_type } = req.body;
+
+        if (!ucc || !exchange || !segment || !symbol || !quantity || !side) {
+            return res.status(400).json({ error: 'Missing required fields.' });
+        }
+
+        const pool = await getConnection();
+
+        // Verify client exists
+        const clientCheck = await pool.request()
+            .input('ucc', sql.VarChar(20), ucc)
+            .query(`SELECT ucc, client_name FROM clients WHERE ucc = @ucc AND is_active = 1`);
+        if (clientCheck.recordset.length === 0) {
+            return res.status(404).json({ error: 'Client not found.' });
+        }
+
+        // Check segment enabled
+        const segCtrl = await pool.request()
+            .input('exchange', sql.VarChar(10), exchange)
+            .input('segment',  sql.VarChar(10), segment)
+            .query(`SELECT is_enabled FROM segment_controls
+                    WHERE exchange = @exchange AND segment = @segment`);
+        if (segCtrl.recordset.length > 0 && !segCtrl.recordset[0].is_enabled) {
+            return res.status(403).json({ error: 'SEGMENT_DISABLED', message: 'Trading application is functioning normally.' });
+        }
+
+        // Check duplicate
+        const dupCheck = await pool.request()
+            .input('ucc',     sql.VarChar(20), ucc)
+            .input('symbol',  sql.VarChar(100), symbol)
+            .input('exchange',sql.VarChar(10),  exchange)
+            .input('segment', sql.VarChar(10),  segment)
+            .query(`SELECT order_id FROM squareoff_orders
+                    WHERE ucc = @ucc AND symbol = @symbol
+                    AND exchange = @exchange AND segment = @segment
+                    AND status NOT IN ('REJECTED','FAILED')
+                    AND CAST(placed_at AS DATE) = CAST(GETDATE() AS DATE)`);
+        if (dupCheck.recordset.length > 0) {
+            return res.status(409).json({ error: 'DUPLICATE_ORDER', message: 'Square-off already placed for this security.' });
+        }
+
+        const client  = clientCheck.recordset[0];
+        const orderId = 'SQ' + Date.now() + Math.random().toString(36).slice(2,6).toUpperCase();
+
+        await pool.request()
+            .input('orderId',     sql.VarChar(50),   orderId)
+            .input('ucc',         sql.VarChar(20),   ucc)
+            .input('exchange',    sql.VarChar(10),   exchange)
+            .input('segment',     sql.VarChar(10),   segment)
+            .input('symbol',      sql.VarChar(100),  symbol)
+            .input('quantity',    sql.Decimal(18,2), quantity)
+            .input('side',        sql.VarChar(4),    side)
+            .input('clientName',  sql.VarChar(200),  client.client_name || '')
+            .input('placedBy',    sql.VarChar(20),   'DEALER')
+            .input('dealerId',    sql.VarChar(10),   String(decoded.dealerId).trim())
+            .input('expiry',      sql.Date,          expiry_date  ? new Date(expiry_date)  : null)
+            .input('strike',      sql.Decimal(18,2), strike_price || null)
+            .input('optionType',  sql.VarChar(5),    option_type  || null)
+            .query(`INSERT INTO squareoff_orders
+                    (order_id, ucc, exchange, segment, symbol, quantity, side,
+                     status, client_name, placed_by, dealer_id,
+                     expiry_date, strike_price, option_type, placed_at)
+                    VALUES
+                    (@orderId, @ucc, @exchange, @segment, @symbol, @quantity, @side,
+                     'ORDER_RECEIVED', @clientName, @placedBy, @dealerId,
+                     @expiry, @strike, @optionType, GETDATE())`);
+
+        return res.json({ success: true, orderId, message: 'Square-off placed successfully.' });
+
+    } catch (err) {
+        console.error('Dealer place-squareoff error:', err);
+        if (err.name === 'TokenExpiredError') return res.status(401).json({ error: 'Session expired.' });
+        return res.status(500).json({ error: 'Failed to place order.' });
+    }
+});
+
 
 module.exports = router;

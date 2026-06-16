@@ -139,38 +139,41 @@ router.post('/sync', validateSyncKey, async (req, res) => {
 
         console.log(`[DropCopy] ${file_source} - ${positions.length} positions bulk upserted`);
 
-        // ── Upsert symbol_master for CM (ISIN mapping) ────────────────────────
+        // ── Batch upsert symbol_master via TVP (single SQL call) ────────────
         const cmPositions = positions.filter(p =>
             (p.isin || '').length > 5 &&
             (p.instrument_type || '').toUpperCase() === 'EQUITY'
         );
 
         if (cmPositions.length > 0) {
-            for (const pos of cmPositions) {
-                try {
-                    await pool.request()
-                        .input('isin',        sql.VarChar(20),  pos.isin)
-                        .input('nseSymbol',   sql.VarChar(50),  exchange === 'NSE' ? pos.symbol : null)
-                        .input('bseSymbol',   sql.VarChar(50),  exchange === 'BSE' ? pos.symbol : null)
-                        .input('companyName', sql.VarChar(200), pos.company_name || null)
-                        .query(`
-                            MERGE symbol_master AS target
-                            USING (SELECT @isin AS isin) AS src ON target.isin = src.isin
-                            WHEN MATCHED THEN
-                                UPDATE SET
-                                    nse_symbol   = COALESCE(@nseSymbol, nse_symbol),
-                                    bse_symbol   = COALESCE(@bseSymbol, bse_symbol),
-                                    company_name = COALESCE(@companyName, company_name)
-                            WHEN NOT MATCHED THEN
-                                INSERT (isin, nse_symbol, bse_symbol, company_name)
-                                VALUES (@isin, @nseSymbol, @bseSymbol, @companyName);
-                        `);
-                } catch (smErr) {
-                    // Non-blocking — symbol_master failure doesn't break sync
-                    console.error('[DropCopy] symbol_master upsert error:', smErr.message);
-                }
+            try {
+                // Build inline VALUES list — much faster than 598 individual calls
+                const vals = cmPositions.map((_, i) => `(@i${i}, @ns${i}, @bs${i}, @cn${i})`).join(',');
+                const req  = pool.request();
+                cmPositions.forEach((pos, i) => {
+                    req.input(`i${i}`,  sql.VarChar(20),  pos.isin || '');
+                    req.input(`ns${i}`, sql.VarChar(50),  exchange === 'NSE' ? pos.symbol : null);
+                    req.input(`bs${i}`, sql.VarChar(50),  exchange === 'BSE' ? pos.symbol : null);
+                    req.input(`cn${i}`, sql.VarChar(200), pos.company_name || null);
+                });
+                await req.query(`
+                    MERGE symbol_master AS target
+                    USING (VALUES ${vals}) AS src(isin, nse_symbol, bse_symbol, company_name)
+                    ON target.isin = src.isin
+                    WHEN MATCHED THEN
+                        UPDATE SET
+                            nse_symbol   = COALESCE(src.nse_symbol,   target.nse_symbol),
+                            bse_symbol   = COALESCE(src.bse_symbol,   target.bse_symbol),
+                            company_name = COALESCE(src.company_name, target.company_name)
+                    WHEN NOT MATCHED THEN
+                        INSERT (isin, nse_symbol, bse_symbol, company_name)
+                        VALUES (src.isin, src.nse_symbol, src.bse_symbol, src.company_name);
+                `);
+                console.log(`[DropCopy] symbol_master: ${cmPositions.length} ISIN records upserted`);
+            } catch (smErr) {
+                console.error('[DropCopy] symbol_master batch upsert error:', smErr.message);
+                // Non-blocking — symbol_master failure doesn't break sync
             }
-            console.log(`[DropCopy] symbol_master: ${cmPositions.length} ISIN records upserted`);
         }
 
         return res.json({

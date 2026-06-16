@@ -8,6 +8,17 @@ const { getConnection, sql } = require('../config/database');
 const { adminAuthenticate } = require('../middleware/adminAuthenticate');
 require('dotenv').config();
 
+// ── IST end-of-day helper ─────────────────────────────────────────────────────
+function getISTEndOfDay() {
+    // Returns end of current calendar day in IST (23:59:59 IST = 18:29:59 UTC)
+    const nowIST    = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+    const eodUTC    = new Date(Date.UTC(
+        nowIST.getUTCFullYear(), nowIST.getUTCMonth(), nowIST.getUTCDate(),
+        18, 29, 59, 0   // 23:59:59 IST
+    ));
+    return eodUTC > new Date() ? eodUTC : new Date(eodUTC.getTime() + 24*60*60*1000);
+}
+
 /* ── Fire-and-forget system log writer ───────────────────────────────────────*/
 function writeLog(logType, actor, actorType, ucc, ip, details, status) {
     setImmediate(async () => {
@@ -105,7 +116,7 @@ router.post('/login/initiate', async (req, res) => {
         const otp       = Math.floor(100000 + Math.random() * 900000).toString();
         const otpHash   = await bcrypt.hash(otp, 10);
         const sessionId = uuidv4();
-        const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+        const expiresAt = getISTEndOfDay(); // Expires at 23:59:59 IST today
 
         await pool.request()
             .input('sessionId', sql.VarChar, sessionId)
@@ -162,9 +173,17 @@ router.post('/login/verify-otp', async (req, res) => {
         await pool.request().input('adminId', sql.Int, session.admin_id)
             .query('UPDATE admin_users SET last_login=GETDATE() WHERE admin_id=@adminId');
 
+        // JWT expires at end of IST calendar day
+        const nowISTjwt    = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+        const eodISTjwt    = new Date(Date.UTC(
+            nowISTjwt.getUTCFullYear(), nowISTjwt.getUTCMonth(), nowISTjwt.getUTCDate(),
+            18, 29, 59, 0
+        ));
+        const jwtExpiry    = Math.floor((eodISTjwt > new Date() ? eodISTjwt
+            : new Date(eodISTjwt.getTime() + 24*60*60*1000)).getTime() / 1000);
         const token = jwt.sign(
             { adminId: session.admin_id, username: session.username, role: session.role, name: session.full_name },
-            process.env.JWT_SECRET, { expiresIn: '24h' }
+            process.env.JWT_SECRET, { expiresIn: jwtExpiry - Math.floor(Date.now()/1000) }
         );
 
         writeLog('ADMIN_LOGIN_SUCCESS', session.full_name, 'ADMIN', null, ip, `Admin ${session.username} logged in`, 'SUCCESS');
