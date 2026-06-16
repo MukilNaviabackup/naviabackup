@@ -93,9 +93,8 @@ router.post('/login/initiate', async (req, res) => {
         }
 
         const dealer = result.recordset[0];
-        // Check force retrigger
-        const forceNew = (dealer_id.toUpperCase().trim().endsWith('?FORCE=1'));
-        const cleanDealerId = dealer_id.toUpperCase().trim().replace('?FORCE=1','');
+        // Check force retrigger (sent as separate field)
+        const forceNew = !!(req.body.force);
 
         // Reuse existing valid session (unless force=1)
         if (!forceNew) {
@@ -354,13 +353,27 @@ router.post('/client-data', async (req, res) => {
                         WHERE ucc = @ucc
                         AND biz_date = (SELECT MAX(biz_date) FROM bf_positions WHERE ucc = @ucc)
                         ORDER BY instrument_type, symbol`),
-            // Holdings (NSDL DP holdings)
+            // Holdings — try holdings table, fall back gracefully
             pool.request().input('ucc', sql.VarChar(20), ucc.trim())
-                .query(`SELECT id, ucc, isin, company_name, quantity,
+                .query(`
+                    IF OBJECT_ID('holdings','U') IS NOT NULL
+                        SELECT id, ucc, isin, company_name, quantity,
                                close_price, total_value, holding_date
-                        FROM holdings
+                        FROM holdings WHERE ucc = @ucc ORDER BY company_name
+                    ELSE
+                        SELECT ucc,
+                               symbol AS company_name,
+                               NULL AS isin,
+                               qty_in_lots AS quantity,
+                               NULL AS close_price,
+                               NULL AS total_value,
+                               biz_date AS holding_date
+                        FROM bf_positions
                         WHERE ucc = @ucc
-                        ORDER BY company_name`).catch(() => ({ recordset: [] }))
+                        AND instrument_type = 'EQUITY'
+                        AND biz_date = (SELECT MAX(biz_date) FROM bf_positions WHERE ucc = @ucc AND instrument_type='EQUITY')
+                        ORDER BY symbol
+                `).catch(() => ({ recordset: [] }))
         ]);
 
         // Log dealer access
