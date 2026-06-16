@@ -93,10 +93,34 @@ router.post('/login/initiate', async (req, res) => {
         }
 
         const dealer = result.recordset[0];
+        // Check force retrigger
+        const forceNew = (dealer_id.toUpperCase().trim().endsWith('?FORCE=1'));
+        const cleanDealerId = dealer_id.toUpperCase().trim().replace('?FORCE=1','');
+
+        // Reuse existing valid session (unless force=1)
+        if (!forceNew) {
+            const existingSession = await pool.request()
+                .input('dealerId', sql.VarChar(10), String(dealer.dealer_id).trim())
+                .query(`SELECT TOP 1 session_id FROM dealer_otp_sessions
+                        WHERE dealer_id=@dealerId AND is_used=0 AND attempt_count<3 AND expires_at>GETDATE()
+                        ORDER BY expires_at DESC`);
+
+            if (existingSession.recordset.length > 0) {
+                writeLog('DEALER_OTP_SENT', dealer.full_name, 'DEALER', null, ip, `OTP reused for ${dealer.email}`, 'SUCCESS');
+                return res.json({
+                    success: true,
+                    sessionId: existingSession.recordset[0].session_id,
+                    email: dealer.email.replace(/(.{2})(.*)(@.*)/, '$1***$3'),
+                    message: 'OTP already sent today.',
+                    reused: true
+                });
+            }
+        }
+
         const otp       = Math.floor(100000 + Math.random() * 900000).toString();
         const otpHash   = await bcrypt.hash(otp, 10);
         const sessionId = uuidv4();
-        const expiresAt = getISTEndOfDay(); // Expires 23:59:59 IST today
+        const expiresAt = getISTEndOfDay();
 
         await pool.request()
             .input('sessionId', sql.VarChar(36), sessionId)
@@ -304,7 +328,7 @@ router.post('/client-data', async (req, res) => {
         const istDate   = new Date(now.getTime() + 5.5 * 60 * 60 * 1000);
         const tradeDate = istDate.toISOString().slice(0, 10);
 
-        const [positions, orders, dayPos, bfPos] = await Promise.all([
+        const [positions, orders, dayPos, bfPos, holdingsRes] = await Promise.all([
             // Broker positions
             pool.request().input('ucc', sql.VarChar(20), ucc.trim())
                 .query(`SELECT * FROM positions WHERE ucc = @ucc ORDER BY symbol`),
@@ -329,7 +353,14 @@ router.post('/client-data', async (req, res) => {
                 .query(`SELECT * FROM bf_positions
                         WHERE ucc = @ucc
                         AND biz_date = (SELECT MAX(biz_date) FROM bf_positions WHERE ucc = @ucc)
-                        ORDER BY instrument_type, symbol`)
+                        ORDER BY instrument_type, symbol`),
+            // Holdings (NSDL DP holdings)
+            pool.request().input('ucc', sql.VarChar(20), ucc.trim())
+                .query(`SELECT id, ucc, isin, company_name, quantity,
+                               close_price, total_value, holding_date
+                        FROM holdings
+                        WHERE ucc = @ucc
+                        ORDER BY company_name`).catch(() => ({ recordset: [] }))
         ]);
 
         // Log dealer access
@@ -349,6 +380,7 @@ router.post('/client-data', async (req, res) => {
             orders:        orders.recordset,
             day_positions: dayPos.recordset,
             bf_positions:  bfPos.recordset,
+            holdings:      holdingsRes.recordset || [],
             trade_date:    tradeDate
         });
 

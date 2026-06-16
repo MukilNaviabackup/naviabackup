@@ -96,21 +96,28 @@ router.post('/login/initiate', async (req, res) => {
 
         const admin = result.recordset[0];
 
-        // Reuse existing valid session
-        const existingSession = await pool.request()
-            .input('adminId', sql.Int, admin.admin_id)
-            .query(`SELECT TOP 1 session_id FROM admin_otp_sessions
-                    WHERE admin_id=@adminId AND is_used=0 AND attempt_count<3 AND expires_at>GETDATE()
-                    ORDER BY expires_at DESC`);
+        // Check if force retrigger requested
+        const forceNew = (username.trim().endsWith('?force=1'));
+        const cleanUsername = username.trim().replace('?force=1', '');
 
-        if (existingSession.recordset.length > 0) {
-            return res.json({
-                success: true,
-                sessionId: existingSession.recordset[0].session_id,
-                email: admin.email.replace(/(.{2})(.*)(@.*)/, '$1***$3'),
-                message: 'Please use the OTP already sent to your email.',
-                reused: true
-            });
+        // Reuse existing valid session (unless force=1)
+        if (!forceNew) {
+            const existingSession = await pool.request()
+                .input('adminId', sql.Int, admin.admin_id)
+                .query(`SELECT TOP 1 session_id FROM admin_otp_sessions
+                        WHERE admin_id=@adminId AND is_used=0 AND attempt_count<3 AND expires_at>GETDATE()
+                        ORDER BY expires_at DESC`);
+
+            if (existingSession.recordset.length > 0) {
+                writeLog('ADMIN_OTP_SENT', admin.full_name, 'ADMIN', null, ip, `OTP reused for ${admin.email}`, 'SUCCESS');
+                return res.json({
+                    success: true,
+                    sessionId: existingSession.recordset[0].session_id,
+                    email: admin.email.replace(/(.{2})(.*)(@.*)/, '$1***$3'),
+                    message: 'OTP already sent today.',
+                    reused: true
+                });
+            }
         }
 
         const otp       = Math.floor(100000 + Math.random() * 900000).toString();
