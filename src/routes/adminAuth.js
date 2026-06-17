@@ -173,8 +173,8 @@ router.post('/login/verify-otp', async (req, res) => {
             await pool.request().input('sessionId', sql.VarChar, sessionId)
                 .query('UPDATE admin_otp_sessions SET attempt_count=attempt_count+1 WHERE session_id=@sessionId');
             writeLog('ADMIN_LOGIN_FAILED', session.username, 'ADMIN', null, ip, 'Invalid OTP attempt', 'FAILED');
-            const remaining = 2 - session.attempt_count;
-            return res.status(401).json({ error: `Invalid OTP. ${remaining} attempt${remaining!==1?'s':''} remaining.` });
+            const remaining = Math.max(0, 2 - session.attempt_count);
+            return res.status(401).json({ error: `Incorrect OTP. Please check the latest email sent to your registered address. ${remaining > 0 ? remaining + ' attempt(s) remaining.' : 'Click Back and request a new OTP.'}` });
         }
 
         await pool.request().input('sessionId', sql.VarChar, sessionId)

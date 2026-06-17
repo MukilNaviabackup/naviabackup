@@ -164,8 +164,11 @@ router.post('/login/verify-otp', async (req, res) => {
         if (!isValid) {
             await pool.request().input('sessionId', sql.VarChar(36), sessionId)
                 .query('UPDATE dealer_otp_sessions SET attempt_count=attempt_count+1 WHERE session_id=@sessionId');
+            const remaining = 2 - session.attempt_count;
             writeLog('DEALER_LOGIN_FAILED', dealerIdValue, 'DEALER', null, ip, 'Invalid OTP attempt', 'FAILED');
-            return res.status(401).json({ error: 'Invalid OTP. Please try again.' });
+            return res.status(401).json({ 
+                error: `Incorrect OTP. Please check the latest email sent to your registered address. ${remaining > 0 ? remaining + ' attempt(s) remaining.' : 'Click Back and request a new OTP.'}` 
+            });
         }
 
         await pool.request().input('sessionId', sql.VarChar(36), sessionId)
@@ -475,73 +478,87 @@ router.post('/place-squareoff', async (req, res) => {
 
 
 
-// ── Internal helper: fetch holdings from Sharepro for a given UCC ────────────
-// Uses same Sharepro API as holdings.js route
-const https = require('https');
-const http  = require('http');
+// ── Internal helper: fetch holdings from Sharepro (mirrors holdings.js exactly) ─
+const https_mod = require('https');
+const NodeCache = require('node-cache');
+const holdingsDealerCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
+
+const SHAREPRO_URL_DEALER = 'https://backoffice.navia.co.in/shrdbms/dotnet/api/stansoft/GetDpHoldingData';
+const SHAREPRO_KEY_DEALER = process.env.SHAREPRO_API_KEY || 'e0JDQzRGQzRCLTU1QTEtNEM0Qi04M0E1LURGRjA0NERCNzgxRX0=';
+
+function getDealerTodayDate() {
+    const now  = new Date();
+    const dd   = String(now.getDate()).padStart(2, '0');
+    const mm   = String(now.getMonth() + 1).padStart(2, '0');
+    const yyyy = now.getFullYear();
+    return `${dd}/${mm}/${yyyy}`;
+}
 
 async function fetchHoldingsForUCC(ucc) {
-    try {
-        // Try to reuse holdings module directly
-        const holdingsRoute = require('./holdings');
-        if (typeof holdingsRoute.getHoldingsData === 'function') {
-            const data = await holdingsRoute.getHoldingsData(ucc);
-            return { recordset: Array.isArray(data) ? data : [] };
-        }
-    } catch(e) {}
+    const today    = getDealerTodayDate();
+    const cacheKey = `dealer-holdings:${ucc}:${today}`;
 
-    // Direct Sharepro API call (same as holdings.js)
-    try {
-        const now     = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
-        const dd      = String(now.getUTCDate()).padStart(2,'0');
-        const mm      = String(now.getUTCMonth()+1).padStart(2,'0');
-        const yyyy    = now.getUTCFullYear();
-        const dateStr = `${dd}/${mm}/${yyyy}`;
+    const cached = holdingsDealerCache.get(cacheKey);
+    if (cached) {
+        console.log(`[Holdings-Dealer] Cache hit: ${ucc}`);
+        return { recordset: cached };
+    }
 
-        const SHAREPRO_URL = process.env.SHAREPRO_URL || process.env.HOLDINGS_API_URL || '';
-        const SHAREPRO_KEY = process.env.SHAREPRO_API_KEY || process.env.HOLDINGS_API_KEY || '';
-
-        if (!SHAREPRO_URL) {
-            console.log('[Holdings-Dealer] No SHAREPRO_URL env var — returning empty');
-            return { recordset: [] };
-        }
-
-        const url = new URL(SHAREPRO_URL);
-        url.searchParams.set('ucc',  ucc);
-        url.searchParams.set('date', dateStr);
-        if (SHAREPRO_KEY) url.searchParams.set('key', SHAREPRO_KEY);
-
-        const lib = url.protocol === 'https:' ? https : http;
-
-        const raw = await new Promise((resolve, reject) => {
-            const req = lib.get(url.toString(), { timeout: 8000 }, (res) => {
-                let body = '';
-                res.on('data', d => body += d);
-                res.on('end', () => resolve(body));
-            });
-            req.on('error', reject);
-            req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+    return new Promise((resolve) => {
+        const body = JSON.stringify({
+            key:      SHAREPRO_KEY_DEALER,
+            ucc:      ucc,
+            segments: 'NSDL',
+            date:     today
         });
 
-        const parsed = JSON.parse(raw);
-        const items  = parsed.curdata || parsed.data || parsed.holdings || [];
-        const result = items.map(h => ({
-            ucc,
-            isin:         h.isincd  || h.isin  || '',
-            company_name: h.compname || h.name  || '',
-            quantity:     Number(h.balance) || 0,
-            close_price:  Number(h.closerate) || null,
-            total_value:  Number(h.holding)   || null,
-            holding_date: dateStr
-        })).filter(h => h.quantity > 0);
+        const urlObj  = new URL(SHAREPRO_URL_DEALER);
+        const options = {
+            hostname: urlObj.hostname,
+            path:     urlObj.pathname,
+            method:   'POST',
+            headers:  {
+                'Content-Type':   'application/json',
+                'Content-Length': Buffer.byteLength(body),
+            },
+            timeout: 15000
+        };
 
-        console.log(`[Holdings-Dealer] Fetched ${result.length} holdings for ${ucc}`);
-        return { recordset: result };
+        const req = https_mod.request(options, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                try {
+                    const parsed     = JSON.parse(data);
+                    const rawHoldings = parsed.curdata || [];
+                    const holdings   = rawHoldings.map((h, idx) => ({
+                        id:           idx + 1,
+                        isin:         h.isincd?.trim()    || '',
+                        symbol:       h.compname?.trim()  || '',
+                        company_name: h.compname?.trim()  || '',
+                        quantity:     Number(h.balance)   || 0,
+                        close_price:  Number(h.closerate) || 0,
+                        total_value:  Number(h.holding)   || 0,
+                        idn:          h.idn?.trim()       || '',
+                    })).filter(h => h.quantity > 0);
 
-    } catch(e) {
-        console.error('[Holdings-Dealer] Fetch error:', e.message);
-        return { recordset: [] };
-    }
+                    holdingsDealerCache.set(cacheKey, holdings);
+                    console.log(`[Holdings-Dealer] Fetched ${holdings.length} holdings for ${ucc}`);
+                    resolve({ recordset: holdings });
+                } catch (e) {
+                    console.error('[Holdings-Dealer] Parse error:', e.message);
+                    resolve({ recordset: [] });
+                }
+            });
+        });
+
+        req.on('error',   err => { console.error('[Holdings-Dealer] Error:', err.message); resolve({ recordset: [] }); });
+        req.on('timeout', ()  => { req.destroy(); console.error('[Holdings-Dealer] Timeout'); resolve({ recordset: [] }); });
+
+        req.write(body);
+        req.end();
+    });
 }
+
 
 module.exports = router;
