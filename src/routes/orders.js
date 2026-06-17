@@ -55,13 +55,20 @@ router.post('/squareoff', authenticate, async (req, res) => {
         // ── Check duplicate ───────────────────────────────────────────────
         const existing = await pool.request()
             .input('ucc',      sql.VarChar, ucc)
-            .input('symbol',   sql.VarChar, symbol.toUpperCase())
-            .input('exchange', sql.VarChar, exchange.toUpperCase())
+            .input('symbol',     sql.VarChar,       symbol.toUpperCase())
+            .input('exchange',   sql.VarChar,       exchange.toUpperCase())
+            .input('expiry',     sql.Date,           expiry_date   ? new Date(expiry_date)  : null)
+            .input('strike',     sql.Decimal(18,2),  strike_price  ? Number(strike_price)   : null)
+            .input('optionType', sql.VarChar(5),     option_type   || null)
             .query(`SELECT order_id FROM squareoff_orders
                     WHERE ucc      = @ucc
                     AND   symbol   = @symbol
                     AND   exchange = @exchange
-                    AND   status NOT IN ('FAILED')`);
+                    AND   status NOT IN ('FAILED','REJECTED','ORDER_TRADED','TRADED')
+                    AND   CAST(placed_at AS DATE) = CAST(GETDATE() AS DATE)
+                    AND   (expiry_date  = @expiry     OR (@expiry     IS NULL AND expiry_date  IS NULL))
+                    AND   (ABS(ISNULL(strike_price,0) - ISNULL(@strike,0)) < 0.01)
+                    AND   (option_type  = @optionType OR (@optionType IS NULL AND option_type  IS NULL))`);
 
         console.log(`[Orders] Step 4: duplicate check done count=${existing.recordset.length}`);
         if (existing.recordset.length > 0) {

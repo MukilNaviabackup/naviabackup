@@ -311,6 +311,7 @@ router.post('/client-data', async (req, res) => {
         if (!ucc) return res.status(400).json({ error: 'UCC is required.' });
 
         const pool = await getConnection();
+        console.log(`[ClientData] Step 1: pool connected for UCC=${ucc} dealer=${decoded.dealerId}`);
 
         // Verify client exists and is active
         const clientResult = await pool.request()
@@ -330,12 +331,12 @@ router.post('/client-data', async (req, res) => {
         const istDate   = new Date(now.getTime() + 5.5 * 60 * 60 * 1000);
         const tradeDate = istDate.toISOString().slice(0, 10);
 
-        const [positions, orders, dayPos, bfPos, holdingsRes] = await Promise.all([
-            // Broker positions (catch errors gracefully)
+        console.log(`[ClientData] Step 2: client verified ${client.client_name}`);
+        // Step 1: Fetch all DB data in parallel (fast, no external calls)
+        const [positions, orders, dayPos, bfPos] = await Promise.all([
             pool.request().input('ucc', sql.VarChar(20), ucc.trim())
                 .query(`SELECT * FROM positions WHERE ucc = @ucc ORDER BY symbol`)
                 .catch(() => ({ recordset: [] })),
-            // Sq-off orders — source of truth for squareoff_placed state
             pool.request().input('ucc', sql.VarChar(20), ucc.trim())
                 .query(`SELECT order_id, ucc, exchange, segment, symbol,
                                quantity, executed_qty, remaining_qty,
@@ -343,24 +344,39 @@ router.post('/client-data', async (req, res) => {
                                expiry_date, strike_price, option_type
                         FROM squareoff_orders
                         WHERE ucc = @ucc
-                        ORDER BY placed_at DESC`),
-            // Day positions from DropCopy
+                        ORDER BY placed_at DESC`)
+                .catch(() => ({ recordset: [] })),
             pool.request()
                 .input('ucc', sql.VarChar(20), ucc.trim())
-                .input('tradeDate', sql.Date, new Date(tradeDate))
                 .query(`SELECT * FROM day_positions
-                        WHERE ucc = @ucc AND trade_date = @tradeDate
-                        ORDER BY instrument_type, symbol`),
-            // B/F positions
+                        WHERE ucc = @ucc 
+                        AND trade_date = (
+                            SELECT MAX(trade_date) FROM day_positions 
+                            WHERE ucc = @ucc
+                            AND trade_date >= CAST(DATEADD(day,-1,GETDATE()) AS DATE)
+                        )
+                        ORDER BY instrument_type, symbol`)
+                .catch(() => ({ recordset: [] })),
             pool.request().input('ucc', sql.VarChar(20), ucc.trim())
                 .query(`SELECT * FROM bf_positions
                         WHERE ucc = @ucc
                         AND biz_date = (SELECT MAX(biz_date) FROM bf_positions WHERE ucc = @ucc)
-                        ORDER BY instrument_type, symbol`),
-            // Holdings — fetch from Sharepro via holdings.js route logic
-            // Call internal holdings fetch function directly
-            fetchHoldingsForUCC(ucc.trim())
+                        ORDER BY instrument_type, symbol`)
+                .catch(() => ({ recordset: [] })),
         ]);
+
+        console.log(`[ClientData] Step 3: DB data fetched positions=${positions.recordset.length} orders=${orders.recordset.length} day=${dayPos.recordset.length} bf=${bfPos.recordset.length}`);
+        // Step 2: Fetch holdings from Sharepro separately with strict timeout
+        let holdingsRes = { recordset: [] };
+        try {
+            const holdingsPromise = fetchHoldingsForUCC(ucc.trim());
+            const timeoutPromise  = new Promise(resolve =>
+                setTimeout(() => resolve({ recordset: [] }), 8000)
+            );
+            holdingsRes = await Promise.race([holdingsPromise, timeoutPromise]);
+        } catch (he) {
+            console.error('[ClientData] Holdings error (non-fatal):', he.message);
+        }
 
         // Log dealer access
         await pool.request()
@@ -384,9 +400,13 @@ router.post('/client-data', async (req, res) => {
         });
 
     } catch (err) {
-        console.error('Dealer client-data error:', err);
+        console.error('[ClientData] ERROR:', err.message, err.stack);
         if (err.name === 'TokenExpiredError') return res.status(401).json({ error: 'Session expired. Please login again.' });
-        return res.status(500).json({ error: 'Failed to load client data.' });
+        // Return full error detail to help debug
+        return res.status(500).json({ 
+            error: 'Failed to load client data: ' + err.message,
+            detail: err.message
+        });
     }
 });
 
@@ -529,7 +549,7 @@ async function fetchHoldingsForUCC(ucc) {
                 'Content-Type':   'application/json',
                 'Content-Length': Buffer.byteLength(body),
             },
-            timeout: 15000
+            timeout: 6000
         };
 
         const req = https_mod.request(options, (res) => {
