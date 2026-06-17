@@ -2,7 +2,7 @@
 const { getConnection, sql } = require('../config/database');
 
 // ── Run every 5 seconds ───────────────────────────────────────────────────────
-const RECON_INTERVAL_MS = 5000;
+const RECON_INTERVAL_MS = 30000; // 30s — reduces DB load on Azure SQL S1
 
 // ── Status constants ──────────────────────────────────────────────────────────
 const STATUS = {
@@ -17,10 +17,22 @@ const STATUS = {
 const OPEN_STATUSES = [STATUS.RECEIVED, STATUS.FILE_GENERATED, STATUS.PARTIALLY_TRADED];
 
 // ── Main reconciliation function ──────────────────────────────────────────────
+let _reconRunning = false;
+
 async function reconcile() {
+    if (_reconRunning) return; // Prevent overlapping runs
+    _reconRunning = true;
     let pool;
     try {
         pool = await getConnection();
+
+        // Quick count — skip if no open orders (saves DB connections on idle periods)
+        const cntRes = await pool.request().query(
+            `SELECT COUNT(*) AS cnt FROM squareoff_orders
+             WHERE status IN ('ORDER_RECEIVED','FILE_GENERATED','PARTIALLY_TRADED')
+             AND placed_at >= CAST(GETDATE()-1 AS DATE)`
+        );
+        if (!cntRes.recordset[0].cnt) return;
 
         // Step 1: Get all open orders
         const openOrders = await pool.request().query(`
@@ -46,6 +58,8 @@ async function reconcile() {
         }
     } catch (err) {
         console.error('[Recon] DB connection error:', err.message);
+    } finally {
+        _reconRunning = false;
     }
 }
 

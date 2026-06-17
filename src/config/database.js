@@ -15,10 +15,10 @@ const config = {
         cancelTimeout:          5000,
     },
     pool: {
-        max:                  20,
-        min:                  2,
-        idleTimeoutMillis:    30000,
-        acquireTimeoutMillis: 15000,
+        max:                  8,   // Azure SQL S1 safe limit
+        min:                  1,
+        idleTimeoutMillis:    20000,
+        acquireTimeoutMillis: 10000,
     },
 };
 
@@ -28,7 +28,7 @@ let poolConnecting = false;
 async function getConnection() {
     if (pool && pool.connected) return pool;
     if (poolConnecting) {
-        for (let i = 0; i < 20; i++) {
+        for (let i = 0; i < 30; i++) {
             await new Promise(r => setTimeout(r, 500));
             if (pool && pool.connected) return pool;
         }
@@ -37,12 +37,22 @@ async function getConnection() {
     poolConnecting = true;
     try {
         if (pool) { try { await pool.close(); } catch (_) {} pool = null; }
-        pool = await sql.connect(config);
-        console.log('[DB] Pool connected');
-        return pool;
-    } catch (err) {
-        pool = null;
-        throw err;
+        // Retry up to 3 times with backoff on ECONNRESET
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                pool = await sql.connect(config);
+                console.log('[DB] Pool connected');
+                return pool;
+            } catch (err) {
+                pool = null;
+                if (attempt < 3 && (err.code === 'ECONNRESET' || err.message.includes('socket hang up'))) {
+                    console.warn(`[DB] Connect attempt ${attempt} failed, retrying in ${attempt}s...`);
+                    await new Promise(r => setTimeout(r, attempt * 1000));
+                } else {
+                    throw err;
+                }
+            }
+        }
     } finally {
         poolConnecting = false;
     }
