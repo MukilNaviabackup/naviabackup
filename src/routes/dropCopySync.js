@@ -147,32 +147,35 @@ router.post('/sync', validateSyncKey, async (req, res) => {
 
         if (cmPositions.length > 0) {
             try {
-                // Build inline VALUES list — much faster than 598 individual calls
-                const vals = cmPositions.map((_, i) => `(@i${i}, @ns${i}, @bs${i}, @cn${i})`).join(',');
-                const req  = pool.request();
-                cmPositions.forEach((pos, i) => {
-                    req.input(`i${i}`,  sql.VarChar(20),  pos.isin || '');
-                    req.input(`ns${i}`, sql.VarChar(50),  exchange === 'NSE' ? pos.symbol : null);
-                    req.input(`bs${i}`, sql.VarChar(50),  exchange === 'BSE' ? pos.symbol : null);
-                    req.input(`cn${i}`, sql.VarChar(200), pos.company_name || null);
-                });
-                await req.query(`
-                    MERGE symbol_master AS target
-                    USING (VALUES ${vals}) AS src(isin, nse_symbol, bse_symbol, company_name)
-                    ON target.isin = src.isin
-                    WHEN MATCHED THEN
-                        UPDATE SET
-                            nse_symbol   = COALESCE(src.nse_symbol,   target.nse_symbol),
-                            bse_symbol   = COALESCE(src.bse_symbol,   target.bse_symbol),
-                            company_name = COALESCE(src.company_name, target.company_name)
-                    WHEN NOT MATCHED THEN
-                        INSERT (isin, nse_symbol, bse_symbol, company_name)
-                        VALUES (src.isin, src.nse_symbol, src.bse_symbol, src.company_name);
-                `);
+                // Batch in chunks of 200 (200 × 4 params = 800, safely under 2100 limit)
+                const CHUNK = 200;
+                for (let ci = 0; ci < cmPositions.length; ci += CHUNK) {
+                    const chunk = cmPositions.slice(ci, ci + CHUNK);
+                    const vals  = chunk.map((_, i) => `(@i${i}, @ns${i}, @bs${i}, @cn${i})`).join(',');
+                    const req   = pool.request();
+                    chunk.forEach((pos, i) => {
+                        req.input(`i${i}`,  sql.VarChar(20),  pos.isin || '');
+                        req.input(`ns${i}`, sql.VarChar(50),  exchange === 'NSE' ? pos.symbol : null);
+                        req.input(`bs${i}`, sql.VarChar(50),  exchange === 'BSE' ? pos.symbol : null);
+                        req.input(`cn${i}`, sql.VarChar(200), pos.company_name || null);
+                    });
+                    await req.query(`
+                        MERGE symbol_master AS target
+                        USING (VALUES ${vals}) AS src(isin, nse_symbol, bse_symbol, company_name)
+                        ON target.isin = src.isin
+                        WHEN MATCHED THEN
+                            UPDATE SET
+                                nse_symbol   = COALESCE(src.nse_symbol,   target.nse_symbol),
+                                bse_symbol   = COALESCE(src.bse_symbol,   target.bse_symbol),
+                                company_name = COALESCE(src.company_name, target.company_name)
+                        WHEN NOT MATCHED THEN
+                            INSERT (isin, nse_symbol, bse_symbol, company_name)
+                            VALUES (src.isin, src.nse_symbol, src.bse_symbol, src.company_name);
+                    `);
+                }
                 console.log(`[DropCopy] symbol_master: ${cmPositions.length} ISIN records upserted`);
             } catch (smErr) {
                 console.error('[DropCopy] symbol_master batch upsert error:', smErr.message);
-                // Non-blocking — symbol_master failure doesn't break sync
             }
         }
 

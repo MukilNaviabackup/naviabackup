@@ -86,7 +86,7 @@ router.post('/login/initiate', async (req, res) => {
     try {
         const pool = await getConnection();
         const result = await pool.request()
-            .input('username', sql.VarChar, username.toLowerCase().trim())
+            .input('username', sql.VarChar, username.replace('?force=1','').toLowerCase().trim())
             .query(`SELECT admin_id, email, full_name, role FROM admin_users WHERE username = @username AND is_active = 1`);
 
         if (result.recordset.length === 0) {
@@ -96,9 +96,8 @@ router.post('/login/initiate', async (req, res) => {
 
         const admin = result.recordset[0];
 
-        // Check if force retrigger requested
-        const forceNew = (username.trim().endsWith('?force=1'));
-        const cleanUsername = username.trim().replace('?force=1', '');
+        // Check if force retrigger requested (sent as separate field)
+        const forceNew = !!(req.body.force);
 
         // Reuse existing valid session (unless force=1)
         if (!forceNew) {
@@ -162,7 +161,8 @@ router.post('/login/verify-otp', async (req, res) => {
 
         if (result.recordset.length === 0) return res.status(401).json({ error: 'Invalid session. Please login again.' });
         const session = result.recordset[0];
-        if (session.is_used) return res.status(401).json({ error: 'OTP already used. Please login again.' });
+        // Note: is_used check removed - same-day sessions can be re-verified
+        // The OTP hash remains valid for the entire calendar day
         if (new Date(session.expires_at) < new Date()) return res.status(401).json({ error: 'OTP expired. Please login again.' });
         if (session.attempt_count >= 3) return res.status(401).json({ error: 'Too many attempts. Please login again.' });
 

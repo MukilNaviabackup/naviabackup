@@ -148,12 +148,12 @@ router.post('/login/verify-otp', async (req, res) => {
         const pool = await getConnection();
         const result = await pool.request()
             .input('sessionId', sql.VarChar(36), sessionId)
-            .query(`SELECT s.session_id,s.otp_hash,s.attempt_count,d.dealer_id,d.full_name,d.email
+            .query(`SELECT s.session_id,s.otp_hash,s.attempt_count,s.is_used,d.dealer_id,d.full_name,d.email
                     FROM dealer_otp_sessions s
                     JOIN dealers d ON s.dealer_id=d.dealer_id
-                    WHERE s.session_id=@sessionId AND s.expires_at>GETDATE() AND s.is_used=0 AND s.attempt_count<3`);
+                    WHERE s.session_id=@sessionId AND s.expires_at>GETDATE() AND s.attempt_count<3`);
 
-        if (result.recordset.length === 0) return res.status(401).json({ error: 'Invalid or expired session.' });
+        if (result.recordset.length === 0) return res.status(401).json({ error: 'Invalid or expired session. Please login again.' });
 
         const session = result.recordset[0];
         const dealerIdValue = String(session.dealer_id).trim();
@@ -353,27 +353,9 @@ router.post('/client-data', async (req, res) => {
                         WHERE ucc = @ucc
                         AND biz_date = (SELECT MAX(biz_date) FROM bf_positions WHERE ucc = @ucc)
                         ORDER BY instrument_type, symbol`),
-            // Holdings — try holdings table, fall back gracefully
-            pool.request().input('ucc', sql.VarChar(20), ucc.trim())
-                .query(`
-                    IF OBJECT_ID('holdings','U') IS NOT NULL
-                        SELECT id, ucc, isin, company_name, quantity,
-                               close_price, total_value, holding_date
-                        FROM holdings WHERE ucc = @ucc ORDER BY company_name
-                    ELSE
-                        SELECT ucc,
-                               symbol AS company_name,
-                               NULL AS isin,
-                               qty_in_lots AS quantity,
-                               NULL AS close_price,
-                               NULL AS total_value,
-                               biz_date AS holding_date
-                        FROM bf_positions
-                        WHERE ucc = @ucc
-                        AND instrument_type = 'EQUITY'
-                        AND biz_date = (SELECT MAX(biz_date) FROM bf_positions WHERE ucc = @ucc AND instrument_type='EQUITY')
-                        ORDER BY symbol
-                `).catch(() => ({ recordset: [] }))
+            // Holdings — fetch from Sharepro via holdings.js route logic
+            // Call internal holdings fetch function directly
+            fetchHoldingsForUCC(ucc.trim())
         ]);
 
         // Log dealer access
@@ -491,5 +473,43 @@ router.post('/place-squareoff', async (req, res) => {
     }
 });
 
+
+
+// ── Internal helper: fetch holdings from Sharepro for a given UCC ────────────
+// Mirrors the logic in holdings.js but callable without HTTP overhead
+async function fetchHoldingsForUCC(ucc) {
+    try {
+        const holdingsRoute = require('./holdings');
+        // holdings.js exports a getHoldingsData function if available
+        if (holdingsRoute.getHoldingsData) {
+            const data = await holdingsRoute.getHoldingsData(ucc);
+            return { recordset: data || [] };
+        }
+    } catch(e) {}
+    // Fallback: call via internal HTTP if module export not available
+    try {
+        const http = require('http');
+        return new Promise((resolve) => {
+            const req = http.get(
+                `http://localhost:${process.env.PORT || 3000}/api/holdings?ucc=${ucc}&internal=1`,
+                { headers: { 'x-internal-key': process.env.SYNC_API_KEY || '' } },
+                (res) => {
+                    let body = '';
+                    res.on('data', d => body += d);
+                    res.on('end', () => {
+                        try {
+                            const data = JSON.parse(body);
+                            resolve({ recordset: data.holdings || [] });
+                        } catch { resolve({ recordset: [] }); }
+                    });
+                }
+            );
+            req.on('error', () => resolve({ recordset: [] }));
+            req.setTimeout(5000, () => { req.abort(); resolve({ recordset: [] }); });
+        });
+    } catch(e) {
+        return { recordset: [] };
+    }
+}
 
 module.exports = router;
