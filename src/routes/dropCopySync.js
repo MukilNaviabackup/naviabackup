@@ -147,10 +147,19 @@ router.post('/sync', validateSyncKey, async (req, res) => {
 
         if (cmPositions.length > 0) {
             try {
+                // Deduplicate by ISIN — MERGE fails if source has duplicate ON-clause keys
+                const isinMap = new Map();
+                for (const pos of cmPositions) {
+                    if (pos.isin && !isinMap.has(pos.isin)) {
+                        isinMap.set(pos.isin, pos);
+                    }
+                }
+                const uniquePositions = Array.from(isinMap.values());
+
                 // Batch in chunks of 200 (200 × 4 params = 800, safely under 2100 limit)
                 const CHUNK = 200;
-                for (let ci = 0; ci < cmPositions.length; ci += CHUNK) {
-                    const chunk = cmPositions.slice(ci, ci + CHUNK);
+                for (let ci = 0; ci < uniquePositions.length; ci += CHUNK) {
+                    const chunk = uniquePositions.slice(ci, ci + CHUNK);
                     const vals  = chunk.map((_, i) => `(@i${i}, @ns${i}, @bs${i}, @cn${i})`).join(',');
                     const req   = pool.request();
                     chunk.forEach((pos, i) => {
@@ -173,7 +182,7 @@ router.post('/sync', validateSyncKey, async (req, res) => {
                             VALUES (src.isin, src.nse_symbol, src.bse_symbol, src.company_name);
                     `);
                 }
-                console.log(`[DropCopy] symbol_master: ${cmPositions.length} ISIN records upserted`);
+                console.log(`[DropCopy] symbol_master: ${uniquePositions.length} unique ISIN records upserted`);
             } catch (smErr) {
                 console.error('[DropCopy] symbol_master batch upsert error:', smErr.message);
             }
