@@ -42,38 +42,79 @@ function makeNeatCMRow(serial, side, symbol, qty, ucc, memberCode) {
     ].join(',');
 }
 
+// ── Lot size lookup (NEAT FO requires correct lot size in Col 17) ────────────
+const LOT_SIZES = {
+    'NIFTY': 75, 'BANKNIFTY': 35, 'FINNIFTY': 65, 'MIDCPNIFTY': 120,
+    'SENSEX': 10, 'BANKEX': 15,
+    'RELIANCE': 250, 'TCS': 150, 'INFY': 300, 'HDFCBANK': 550,
+    'ICICIBANK': 700, 'SBIN': 1500, 'BAJFINANCE': 125,
+    'WIPRO': 1500, 'HCLTECH': 700, 'LT': 300, 'AXISBANK': 1200,
+    'TATAMOTORS': 1400, 'TATASTEEL': 5500, 'ADANIENT': 600,
+    'ONGC': 3850, 'POWERGRID': 4700, 'NTPC': 4500,
+};
+function getLotSize(symbol) {
+    if (!symbol) return 75;
+    const base = symbol.toUpperCase().trim().split(/[\s@0-9]/)[0];
+    return LOT_SIZES[base] || 1;
+}
+
 // NSE NEAT FO Basket — options and futures
-function makeNeatFORow(serial, side, symbol, expiry, strikePrice, optionType, qty, ucc, memberCode) {
-    const trans   = side.toUpperCase() === 'BUY' ? '1' : '2';
-    const expStr  = expiry
-        ? new Date(expiry).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: '2-digit' })
-            .toUpperCase().replace(/ /g, '-')
+function makeNeatFORow(serial, side, symbol, expiry, strikePrice, optionType, qty, ucc, memberCode, lotSize) {
+    // Col 3: 1=BUY, 2=SELL
+    const trans = side.toUpperCase() === 'BUY' ? '1' : '2';
+
+    // Col 6: Instrument type — OPTIDX for options, FUTIDX for futures
+    const instrType = (optionType && optionType !== 'XX') ? 'OPTIDX' : 'FUTIDX';
+
+    // Col 8: Expiry in DDMMMYYYY format (e.g. 23JUN2026)
+    let expStr = '          ';
+    if (expiry) {
+        const d   = new Date(expiry);
+        const dd  = String(d.getUTCDate()).padStart(2,'0');
+        const mon = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getUTCMonth()];
+        const yr  = d.getUTCFullYear();
+        expStr = (dd + mon + yr).padEnd(10);
+    }
+
+    // Col 9: Strike price padded (e.g. '25550     ')
+    const strike = strikePrice
+        ? String(Math.round(parseFloat(strikePrice))).padEnd(10)
         : '          ';
-    const strike  = strikePrice ? String(parseFloat(strikePrice).toFixed(2)).padEnd(12) : '            ';
-    // NEAT uses CA (Call) / PA (Put) not CE/PE
-    const optType = optionType
-        ? (optionType === 'CE' ? 'CA' : 'PA').padEnd(4)
-        : 'XX  ';
+
+    // Col 10: Option type CE or PE (blank for futures)
+    const optType = (optionType && optionType !== 'XX') ? optionType : '';
+
+    // Col 17: Lot size
+    const lot = String(lotSize || qty).padEnd(9);
+
+    // 26-column NEAT FO format — matched to RMS exactly
     return [
-        String(serial).padEnd(13),
-        '1 ',
-        trans + ' ',
-        symbol.padEnd(10),
-        expStr.padEnd(10),
-        strike,
-        optType,
-        String(qty) + ' ',
-        '           ',
-        'MKT       ',
-        '        ',
-        '1        ',
-        '         ',
-        memberCode.padEnd(12),
-        '2 ',
-        ucc.padEnd(10),
-        '                         ',
-        '                ',
-        '          ',
+        String(serial).padEnd(13),   // Col 0:  Serial number
+        'O',                          // Col 1:  Order type (letter O = normal)
+        'U',                          // Col 2:  Order category
+        trans + ' ',                  // Col 3:  Buy(1)/Sell(2)
+        '0',                          // Col 4:  Order sub-type
+        '2 ',                         // Col 5:  Product type
+        instrType,                    // Col 6:  OPTIDX or FUTIDX
+        symbol.padEnd(10),            // Col 7:  Symbol
+        expStr,                       // Col 8:  Expiry DDMMMYYYY
+        strike,                       // Col 9:  Strike price
+        optType,                      // Col 10: CE/PE or blank
+        String(qty) + ' ',            // Col 11: Quantity
+        '           ',                // Col 12: Blank
+        '  ',                         // Col 13: Blank
+        '         ',                  // Col 14: Blank
+        'MKT       ',                 // Col 15: Order type MKT
+        '          ',                 // Col 16: Price (blank for MKT)
+        lot,                          // Col 17: Lot size
+        '         ',                  // Col 18: Blank
+        memberCode.padEnd(12),        // Col 19: Member code
+        '2 ',                         // Col 20: Exchange (2=NSE)
+        ucc.padEnd(10),               // Col 21: Client UCC
+        '                         ',  // Col 22: Blank
+        '0 ',                         // Col 23: Disclosed qty
+        '                ',           // Col 24: Blank
+        '            ',               // Col 25: Blank
     ].join(',');
 }
 
@@ -281,7 +322,7 @@ router.post('/orders/generate-file', adminAuthenticate, async (req, res) => {
             } else if (foOrders.length > 0 && cmOrders.length === 0) {
                 filename = basketFilename('BasketFO');
                 foOrders.forEach((o, i) => {
-                    csvRows.push(makeNeatFORow(i + 1, o.side, o.symbol, o.expiry_date, o.strike_price, o.option_type, o.quantity, o.ucc, '07708'));
+                    csvRows.push(makeNeatFORow(i + 1, o.side, o.symbol, o.expiry_date, o.strike_price, o.option_type, o.quantity, o.ucc, '07708', getLotSize(o.symbol)));
                 });
             } else {
                 // Mixed CM+FO — separate into two files; send CM as primary download
@@ -292,7 +333,7 @@ router.post('/orders/generate-file', adminAuthenticate, async (req, res) => {
                 });
                 // FO rows appended after CM
                 foOrders.forEach(o => {
-                    csvRows.push(makeNeatFORow(serial++, o.side, o.symbol, o.expiry_date, o.strike_price, o.option_type, o.quantity, o.ucc, '07708'));
+                    csvRows.push(makeNeatFORow(serial++, o.side, o.symbol, o.expiry_date, o.strike_price, o.option_type, o.quantity, o.ucc, '07708', getLotSize(o.symbol)));
                 });
             }
         } else if (exchange === 'BSE') {
