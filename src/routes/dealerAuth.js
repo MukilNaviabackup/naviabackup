@@ -476,38 +476,70 @@ router.post('/place-squareoff', async (req, res) => {
 
 
 // ── Internal helper: fetch holdings from Sharepro for a given UCC ────────────
-// Mirrors the logic in holdings.js but callable without HTTP overhead
+// Uses same Sharepro API as holdings.js route
+const https = require('https');
+const http  = require('http');
+
 async function fetchHoldingsForUCC(ucc) {
     try {
+        // Try to reuse holdings module directly
         const holdingsRoute = require('./holdings');
-        // holdings.js exports a getHoldingsData function if available
-        if (holdingsRoute.getHoldingsData) {
+        if (typeof holdingsRoute.getHoldingsData === 'function') {
             const data = await holdingsRoute.getHoldingsData(ucc);
-            return { recordset: data || [] };
+            return { recordset: Array.isArray(data) ? data : [] };
         }
     } catch(e) {}
-    // Fallback: call via internal HTTP if module export not available
+
+    // Direct Sharepro API call (same as holdings.js)
     try {
-        const http = require('http');
-        return new Promise((resolve) => {
-            const req = http.get(
-                `http://localhost:${process.env.PORT || 3000}/api/holdings?ucc=${ucc}&internal=1`,
-                { headers: { 'x-internal-key': process.env.SYNC_API_KEY || '' } },
-                (res) => {
-                    let body = '';
-                    res.on('data', d => body += d);
-                    res.on('end', () => {
-                        try {
-                            const data = JSON.parse(body);
-                            resolve({ recordset: data.holdings || [] });
-                        } catch { resolve({ recordset: [] }); }
-                    });
-                }
-            );
-            req.on('error', () => resolve({ recordset: [] }));
-            req.setTimeout(5000, () => { req.abort(); resolve({ recordset: [] }); });
+        const now     = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+        const dd      = String(now.getUTCDate()).padStart(2,'0');
+        const mm      = String(now.getUTCMonth()+1).padStart(2,'0');
+        const yyyy    = now.getUTCFullYear();
+        const dateStr = `${dd}/${mm}/${yyyy}`;
+
+        const SHAREPRO_URL = process.env.SHAREPRO_URL || process.env.HOLDINGS_API_URL || '';
+        const SHAREPRO_KEY = process.env.SHAREPRO_API_KEY || process.env.HOLDINGS_API_KEY || '';
+
+        if (!SHAREPRO_URL) {
+            console.log('[Holdings-Dealer] No SHAREPRO_URL env var — returning empty');
+            return { recordset: [] };
+        }
+
+        const url = new URL(SHAREPRO_URL);
+        url.searchParams.set('ucc',  ucc);
+        url.searchParams.set('date', dateStr);
+        if (SHAREPRO_KEY) url.searchParams.set('key', SHAREPRO_KEY);
+
+        const lib = url.protocol === 'https:' ? https : http;
+
+        const raw = await new Promise((resolve, reject) => {
+            const req = lib.get(url.toString(), { timeout: 8000 }, (res) => {
+                let body = '';
+                res.on('data', d => body += d);
+                res.on('end', () => resolve(body));
+            });
+            req.on('error', reject);
+            req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
         });
+
+        const parsed = JSON.parse(raw);
+        const items  = parsed.curdata || parsed.data || parsed.holdings || [];
+        const result = items.map(h => ({
+            ucc,
+            isin:         h.isincd  || h.isin  || '',
+            company_name: h.compname || h.name  || '',
+            quantity:     Number(h.balance) || 0,
+            close_price:  Number(h.closerate) || null,
+            total_value:  Number(h.holding)   || null,
+            holding_date: dateStr
+        })).filter(h => h.quantity > 0);
+
+        console.log(`[Holdings-Dealer] Fetched ${result.length} holdings for ${ucc}`);
+        return { recordset: result };
+
     } catch(e) {
+        console.error('[Holdings-Dealer] Fetch error:', e.message);
         return { recordset: [] };
     }
 }
