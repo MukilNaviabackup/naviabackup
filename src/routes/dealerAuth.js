@@ -157,7 +157,9 @@ router.post('/login/verify-otp', async (req, res) => {
 
         const session = result.recordset[0];
         const dealerIdValue = String(session.dealer_id).trim();
+        console.log(`[Dealer verify] sessionId=${sessionId} dealer=${dealerIdValue} otp_len=${otp.trim().length}`);
         const isValid = await bcrypt.compare(otp.trim(), session.otp_hash);
+        console.log(`[Dealer verify] bcrypt result=${isValid}`);
 
         if (!isValid) {
             await pool.request().input('sessionId', sql.VarChar(36), sessionId)
@@ -171,11 +173,9 @@ router.post('/login/verify-otp', async (req, res) => {
         await pool.request().input('dealerId', sql.VarChar(10), dealerIdValue)
             .query('UPDATE dealers SET last_login=GETDATE() WHERE dealer_id=@dealerId');
 
-        const eodDealer  = getISTEndOfDay();
-        const secsTilEOD = Math.max(60, Math.floor((eodDealer - Date.now()) / 1000));
         const token = jwt.sign(
             { dealerId: dealerIdValue, name: session.full_name, role: 'DEALER' },
-            process.env.JWT_SECRET, { expiresIn: secsTilEOD }
+            process.env.JWT_SECRET, { expiresIn: '12h' }
         );
 
         writeLog('DEALER_LOGIN_SUCCESS', session.full_name, 'DEALER', null, ip, `Dealer ${dealerIdValue} logged in`, 'SUCCESS');
@@ -267,7 +267,7 @@ router.get('/logs', async (req, res) => {
 router.get('/recent-clients', async (req, res) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
-    if (!token) return res.status(401).json({ error: 'Unauthorized.' });
+    if (!token) return res.json({ success: true, clients: [] }); // No token = return empty, not 401
     try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
         if (!decoded.dealerId) return res.status(401).json({ error: 'Invalid dealer token.' });

@@ -166,7 +166,9 @@ router.post('/login/verify-otp', async (req, res) => {
         if (new Date(session.expires_at) < new Date()) return res.status(401).json({ error: 'OTP expired. Please login again.' });
         if (session.attempt_count >= 3) return res.status(401).json({ error: 'Too many attempts. Please login again.' });
 
+        console.log(`[Admin verify] sessionId=${sessionId} username=${session.username} otp_len=${otp.trim().length}`);
         const isValid = await bcrypt.compare(otp.trim(), session.otp_hash);
+        console.log(`[Admin verify] bcrypt result=${isValid}`);
         if (!isValid) {
             await pool.request().input('sessionId', sql.VarChar, sessionId)
                 .query('UPDATE admin_otp_sessions SET attempt_count=attempt_count+1 WHERE session_id=@sessionId');
@@ -180,17 +182,9 @@ router.post('/login/verify-otp', async (req, res) => {
         await pool.request().input('adminId', sql.Int, session.admin_id)
             .query('UPDATE admin_users SET last_login=GETDATE() WHERE admin_id=@adminId');
 
-        // JWT expires at end of IST calendar day
-        const nowISTjwt    = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
-        const eodISTjwt    = new Date(Date.UTC(
-            nowISTjwt.getUTCFullYear(), nowISTjwt.getUTCMonth(), nowISTjwt.getUTCDate(),
-            18, 29, 59, 0
-        ));
-        const jwtExpiry    = Math.floor((eodISTjwt > new Date() ? eodISTjwt
-            : new Date(eodISTjwt.getTime() + 24*60*60*1000)).getTime() / 1000);
         const token = jwt.sign(
             { adminId: session.admin_id, username: session.username, role: session.role, name: session.full_name },
-            process.env.JWT_SECRET, { expiresIn: jwtExpiry - Math.floor(Date.now()/1000) }
+            process.env.JWT_SECRET, { expiresIn: '12h' }
         );
 
         writeLog('ADMIN_LOGIN_SUCCESS', session.full_name, 'ADMIN', null, ip, `Admin ${session.username} logged in`, 'SUCCESS');
