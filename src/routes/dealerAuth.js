@@ -331,9 +331,10 @@ router.post('/client-data', async (req, res) => {
         const tradeDate = istDate.toISOString().slice(0, 10);
 
         const [positions, orders, dayPos, bfPos, holdingsRes] = await Promise.all([
-            // Broker positions
+            // Broker positions (catch errors gracefully)
             pool.request().input('ucc', sql.VarChar(20), ucc.trim())
-                .query(`SELECT * FROM positions WHERE ucc = @ucc ORDER BY symbol`),
+                .query(`SELECT * FROM positions WHERE ucc = @ucc ORDER BY symbol`)
+                .catch(() => ({ recordset: [] })),
             // Sq-off orders — source of truth for squareoff_placed state
             pool.request().input('ucc', sql.VarChar(20), ucc.trim())
                 .query(`SELECT order_id, ucc, exchange, segment, symbol,
@@ -480,8 +481,15 @@ router.post('/place-squareoff', async (req, res) => {
 
 // ── Internal helper: fetch holdings from Sharepro (mirrors holdings.js exactly) ─
 const https_mod = require('https');
-const NodeCache = require('node-cache');
-const holdingsDealerCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
+// NodeCache loaded lazily to avoid crash if package not installed
+let holdingsDealerCache = null;
+function getDealerCache() {
+    if (!holdingsDealerCache) {
+        try { const NC = require('node-cache'); holdingsDealerCache = new NC({ stdTTL: 300, checkperiod: 60 }); }
+        catch(e) { holdingsDealerCache = { get: () => null, set: () => {} }; }
+    }
+    return holdingsDealerCache;
+}
 
 const SHAREPRO_URL_DEALER = 'https://backoffice.navia.co.in/shrdbms/dotnet/api/stansoft/GetDpHoldingData';
 const SHAREPRO_KEY_DEALER = process.env.SHAREPRO_API_KEY || 'e0JDQzRGQzRCLTU1QTEtNEM0Qi04M0E1LURGRjA0NERCNzgxRX0=';
@@ -498,7 +506,7 @@ async function fetchHoldingsForUCC(ucc) {
     const today    = getDealerTodayDate();
     const cacheKey = `dealer-holdings:${ucc}:${today}`;
 
-    const cached = holdingsDealerCache.get(cacheKey);
+    const cached = getDealerCache().get(cacheKey);
     if (cached) {
         console.log(`[Holdings-Dealer] Cache hit: ${ucc}`);
         return { recordset: cached };
@@ -542,7 +550,7 @@ async function fetchHoldingsForUCC(ucc) {
                         idn:          h.idn?.trim()       || '',
                     })).filter(h => h.quantity > 0);
 
-                    holdingsDealerCache.set(cacheKey, holdings);
+                    getDealerCache().set(cacheKey, holdings);
                     console.log(`[Holdings-Dealer] Fetched ${holdings.length} holdings for ${ucc}`);
                     resolve({ recordset: holdings });
                 } catch (e) {

@@ -29,7 +29,7 @@ async function reconcile() {
                    status, placed_at,
                    expiry_date, strike_price, option_type
             FROM squareoff_orders
-            WHERE status IN ('${OPEN_STATUSES.join("','")}')
+            WHERE status IN ('ORDER_RECEIVED','FILE_GENERATED','PARTIALLY_TRADED')
             AND placed_at >= CAST(GETDATE()-1 AS DATE)
         `);
 
@@ -186,40 +186,66 @@ async function getCMExecutedQty(pool, order) {
     return Number(result.recordset[0]?.executed_qty) || 0;
 }
 
-// Fallback: match CM by symbol directly (for orders without ISIN yet)
+// CM matching by direct symbol (squareoff_orders.symbol = day_positions.symbol for CM)
 async function getCMExecutedQtyBySymbol(pool, order) {
     const sideCol = (order.side || '').toUpperCase() === 'BUY' ? 'buy_qty' : 'sell_qty';
 
-    // Try to find NSE symbol from symbol_master using company name match
-    const symResult = await pool.request()
-        .input('name', sql.VarChar(200), `%${order.symbol.split(' ')[0]}%`)
-        .query(`
-            SELECT TOP 1 nse_symbol, bse_symbol
-            FROM symbol_master
-            WHERE company_name LIKE @name AND is_active = 1
-        `);
-
-    if (symResult.recordset.length === 0) return 0;
-
-    const nseSymbol = symResult.recordset[0].nse_symbol;
-    const bseSymbol = symResult.recordset[0].bse_symbol;
-
-    const result = await pool.request()
-        .input('ucc',       sql.VarChar(20),  order.ucc)
-        .input('nseSymbol', sql.VarChar(50),  nseSymbol || '')
-        .input('bseSymbol', sql.VarChar(50),  bseSymbol || '')
-        .input('placedAt',  sql.DateTime,     new Date(order.placed_at))
+    // PRIMARY: Direct symbol match — squareoff_orders.symbol matches day_positions.symbol
+    // e.g. both have 'WIPRO' for NSE CM trades
+    const directResult = await pool.request()
+        .input('ucc',      sql.VarChar(20), order.ucc)
+        .input('symbol',   sql.VarChar(100), order.symbol.trim())
+        .input('exchange', sql.VarChar(10),  order.exchange)
+        .input('placedAt', sql.DateTime,     new Date(order.placed_at))
         .query(`
             SELECT SUM(dp.${sideCol}) AS executed_qty
             FROM day_positions dp
             WHERE dp.ucc          = @ucc
-            AND   (dp.symbol = @nseSymbol OR dp.symbol = @bseSymbol)
+            AND   dp.symbol       = @symbol
+            AND   dp.exchange     = @exchange
+            AND   dp.segment      = 'CM'
             AND   dp.last_updated > @placedAt
             AND   dp.trade_date   = CAST(GETDATE() AS DATE)
-            AND   dp.segment      = 'CM'
         `);
 
-    return Number(result.recordset[0]?.executed_qty) || 0;
+    const directQty = Number(directResult.recordset[0]?.executed_qty) || 0;
+    if (directQty > 0) return directQty;
+
+    // FALLBACK: symbol_master lookup using first word of symbol name
+    // (handles cases where squareoff_orders stores full name like 'WIPRO LTD')
+    const firstWord = order.symbol.trim().split(/\s+/)[0];
+    const symResult = await pool.request()
+        .input('symbol',   sql.VarChar(50),  firstWord)
+        .input('nameLike', sql.VarChar(200), `%${firstWord}%`)
+        .query(`
+            SELECT TOP 1 nse_symbol, bse_symbol FROM symbol_master
+            WHERE (nse_symbol = @symbol OR bse_symbol = @symbol
+                   OR company_name LIKE @nameLike)
+            AND is_active = 1
+        `);
+
+    if (symResult.recordset.length === 0) return 0;
+
+    const nseSymbol = symResult.recordset[0].nse_symbol || '';
+    const bseSymbol = symResult.recordset[0].bse_symbol || '';
+    if (!nseSymbol && !bseSymbol) return 0;
+
+    const fallbackResult = await pool.request()
+        .input('ucc',       sql.VarChar(20), order.ucc)
+        .input('nseSymbol', sql.VarChar(50), nseSymbol)
+        .input('bseSymbol', sql.VarChar(50), bseSymbol)
+        .input('placedAt',  sql.DateTime,    new Date(order.placed_at))
+        .query(`
+            SELECT SUM(dp.${sideCol}) AS executed_qty
+            FROM day_positions dp
+            WHERE dp.ucc      = @ucc
+            AND  (dp.symbol   = @nseSymbol OR dp.symbol = @bseSymbol)
+            AND   dp.segment  = 'CM'
+            AND   dp.last_updated > @placedAt
+            AND   dp.trade_date   = CAST(GETDATE() AS DATE)
+        `);
+
+    return Number(fallbackResult.recordset[0]?.executed_qty) || 0;
 }
 
 // ── Start service ─────────────────────────────────────────────────────────────
