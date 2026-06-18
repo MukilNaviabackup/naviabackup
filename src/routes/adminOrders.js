@@ -145,34 +145,61 @@ function makeBoltCMRow(serial, side, symbol, qty, ucc, memberCode) {
 }
 
 // BSE BOLT FO format
-function makeBoltFORow(serial, side, symbol, expiry, strikePrice, optionType, qty, ucc, memberCode) {
-    const trans  = side.toUpperCase() === 'BUY' ? '1' : '2';
-    const expStr = expiry
-        ? new Date(expiry).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: '2-digit' })
-            .toUpperCase().replace(/ /g, '-')
-        : '          ';
-    const strike = strikePrice ? String(parseFloat(strikePrice).toFixed(2)).padEnd(12) : '            ';
-    const optType = optionType ? (optionType === 'CE' ? 'CE' : 'PE').padEnd(4) : 'XX  ';
+function makeBoltFORow(serial, side, symbol, expiry, strikePrice, optionType, qty, ucc, memberCode, lotSize) {
+    const trans = side.toUpperCase() === 'BUY' ? '1' : '2';
+
+    // Instrument type: SENSEX uses SXOPT/SXFUT, others use OPTIDX/FUTIDX
+    const sym = (symbol || '').toUpperCase().trim();
+    const isFO  = optionType && optionType !== 'XX';
+    let instrType;
+    if (sym === 'SENSEX' || sym === 'BANKEX') {
+        instrType = isFO ? 'SXOPT' : 'SXFUT';
+    } else {
+        instrType = isFO ? 'OPTIDX' : 'FUTIDX';
+    }
+
+    // Expiry in DDMMMYYYY format
+    let expStr = '          ';
+    if (expiry) {
+        const d   = new Date(expiry);
+        const dd  = String(d.getUTCDate()).padStart(2,'0');
+        const mon = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getUTCMonth()];
+        const yr  = d.getUTCFullYear();
+        expStr = (dd + mon + yr).padEnd(10);
+    }
+
+    const strike  = strikePrice ? String(Math.round(parseFloat(strikePrice))).padEnd(10) : '          ';
+    const optType = isFO ? optionType : '';
+    const lot     = String(lotSize || getLotSize(symbol)).padEnd(9);
+
+    // BSE BOLT FO — 26 columns (same structure as NSE NEAT FO)
     return [
-        String(serial).padEnd(13),
-        '1 ',
-        trans + ' ',
-        symbol.padEnd(10),
-        expStr.padEnd(10),
-        strike,
-        optType,
-        String(qty) + ' ',
-        '           ',
-        'MKT       ',
-        '        ',
-        '1        ',
-        '         ',
-        memberCode.padEnd(12),
-        '2 ',
-        ucc.padEnd(10),
-        '                         ',
-        '                ',
-        '          ',
+        String(serial).padEnd(13),   // Col 0:  Serial
+        'O',                          // Col 1:  Order type (letter O)
+        'U',                          // Col 2:  Order category
+        trans + ' ',                  // Col 3:  Buy/Sell
+        '0',                          // Col 4:  Sub-type
+        '2 ',                         // Col 5:  Product type
+        instrType,                    // Col 6:  SXOPT/SXFUT/OPTIDX/FUTIDX
+        symbol.padEnd(10),            // Col 7:  Symbol
+        expStr,                       // Col 8:  Expiry DDMMMYYYY
+        strike,                       // Col 9:  Strike
+        optType,                      // Col 10: CE/PE or blank
+        String(qty) + ' ',            // Col 11: Quantity
+        '           ',                // Col 12: Blank
+        '  ',                         // Col 13: Blank
+        '         ',                  // Col 14: Blank
+        'MKT       ',             // Col 15: Order type
+        '          ',             // Col 16: Price blank for MKT
+        lot,                      // Col 17: Lot size
+        '         ',              // Col 18: Blank
+        memberCode.padEnd(12),    // Col 19: Clearing code
+        '2 ',                     // Col 20: Exchange
+        ucc.padEnd(10),           // Col 21: UCC
+        '                         ', // Col 22: Blank
+        '0 ',                     // Col 23: Disclosed qty
+        '                ',       // Col 24: Blank
+        '            ',           // Col 25: Blank
     ].join(',');
 }
 
@@ -337,16 +364,64 @@ router.post('/orders/generate-file', adminAuthenticate, async (req, res) => {
                 });
             }
         } else if (exchange === 'BSE') {
+            // BSE BOLT format is XLSX (Excel), not CSV
             const cmOrders = orders.filter(o => o.segment === 'CM');
             const foOrders = orders.filter(o => o.segment === 'FO');
-            filename = basketFilename('BasketBSE');
-            let serial = 1;
+
+            // BOLT headers (11 columns)
+            const boltHeaders = ['Buy/Sell','Qty','Rev.Qty','Scrip Code','Rate',
+                                  'Short/Client ID','Retention Status','Client Type',
+                                  'Order Type','CP Code','TrgRate'];
+
+            // Build rows for CM + FO combined
+            const boltRows = [boltHeaders];
             cmOrders.forEach(o => {
-                csvRows.push(makeBoltCMRow(serial++, o.side, o.symbol, o.quantity, o.ucc, '6341'));
+                const side    = o.side.toUpperCase() === 'BUY' ? 'B' : 'S';
+                const scrip   = o.bse_scrip_code || o.bse_code || '';
+                if (!scrip) {
+                    console.warn(`[BSE BOLT] No scrip code for order ${o.order_id} ${o.symbol}`);
+                }
+                boltRows.push([side, o.quantity, o.quantity, scrip, '',
+                               o.ucc, 'EOSESS', 'CLIENT', 'G', '', '']);
             });
             foOrders.forEach(o => {
-                csvRows.push(makeBoltFORow(serial++, o.side, o.symbol, o.expiry_date, o.strike_price, o.option_type, o.quantity, o.ucc, '6341'));
+                const side  = o.side.toUpperCase() === 'BUY' ? 'B' : 'S';
+                const scrip = o.bse_scrip_code || o.bse_code || '';
+                if (!scrip) {
+                    console.warn(`[BSE BOLT] No scrip code for FO order ${o.order_id} ${o.symbol}`);
+                }
+                boltRows.push([side, o.quantity, o.quantity, scrip, '',
+                               o.ucc, 'EOSESS', 'CLIENT', 'G', '', '']);
             });
+
+            // Generate XLSX file
+            try {
+                const XLSX = require('xlsx');
+                const ws   = XLSX.utils.aoa_to_sheet(boltRows);
+                const wb   = XLSX.utils.book_new();
+                XLSX.utils.book_append_sheet(wb, ws, 'BOLT');
+                const xlsxBuffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+                filename = basketFilename('BasketBSE').replace('.csv', '.xlsx');
+
+                // Mark orders as file generated (before sending)
+                await pool.request().query(`
+                    UPDATE squareoff_orders
+                    SET file_generated = 1, file_generated_at = GETDATE(), status = 'FILE_GENERATED'
+                    WHERE order_id IN (${idList}) AND status = 'ORDER_RECEIVED'`);
+
+                res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+                res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+                return res.send(xlsxBuffer);
+            } catch (xlsxErr) {
+                console.error('[BSE BOLT] XLSX generation error:', xlsxErr.message);
+                // Fallback: send as CSV if xlsx fails
+                cmOrders.concat(foOrders).forEach(o => {
+                    const side  = o.side.toUpperCase() === 'BUY' ? 'B' : 'S';
+                    const scrip = o.bse_scrip_code || o.bse_code || '';
+                    csvRows.push([side, o.quantity, o.quantity, scrip, '',
+                                  o.ucc, 'EOSESS', 'CLIENT', 'G', '', ''].join(','));
+                });
+            }
         } else if (exchange === 'MCX') {
             filename = basketFilename('BasketMCX');
             orders.forEach((o, i) => {

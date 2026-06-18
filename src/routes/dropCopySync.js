@@ -92,6 +92,7 @@ router.post('/sync', validateSyncKey, async (req, res) => {
         tvp.columns.add('symbol',          sql.VarChar(50));
         tvp.columns.add('isin',            sql.VarChar(20));
         tvp.columns.add('company_name',    sql.VarChar(200));
+        tvp.columns.add('bse_scrip_code',  sql.VarChar(20));
         tvp.columns.add('instrument_type', sql.VarChar(20));
         tvp.columns.add('expiry_date',     sql.Date);
         tvp.columns.add('strike_price',    sql.Decimal(10,4));
@@ -115,8 +116,9 @@ router.post('/sync', validateSyncKey, async (req, res) => {
                 exchange.trim(),
                 segment.trim(),
                 (pos.symbol       || '').toString().substring(0, 50),
-                (pos.isin         || '').toString().substring(0, 20),
-                (pos.company_name || '').toString().substring(0, 200),
+                (pos.isin           || '').toString().substring(0, 20),
+                (pos.company_name   || '').toString().substring(0, 200),
+                (pos.bse_scrip_code || '').toString().substring(0, 20),
                 (pos.instrument_type || 'EQUITY').substring(0, 20),
                 pos.expiry_date ? new Date(pos.expiry_date) : null,
                 pos.strike_price  || null,
