@@ -1,5 +1,6 @@
 'use strict';
 const { getConnection, sql } = require('../config/database');
+const { notifyTradeStatusChange } = require('./tradeNotification');
 
 // ── Run every 5 seconds ───────────────────────────────────────────────────────
 const RECON_INTERVAL_MS = 30000; // 30s — reduces DB load on Azure SQL S1
@@ -130,6 +131,16 @@ async function reconcileOrder(pool, order) {
             VALUES
                 (@orderId, @ucc, @oldStatus, @newStatus, @executedQty, @remainingQty, GETDATE())
         `);
+
+    // Notify client via Email + WhatsApp on Fully/Partially Traded transitions only.
+    // Only fire when the status is actually NEW (avoid duplicate notifications when
+    // partial trade qty increases but status stays PARTIALLY_TRADED).
+    if (newStatus !== order.status &&
+        (newStatus === STATUS.TRADED || newStatus === STATUS.PARTIALLY_TRADED)) {
+        const orderForNotify = { ...order, status: newStatus, executed_qty: executedQty, remaining_qty: remainingQty, traded_at: new Date() };
+        notifyTradeStatusChange(pool, sql, orderForNotify, newStatus)
+            .catch(err => console.error('[Recon] Notification error (non-fatal):', err.message));
+    }
 }
 
 // ── FO Matching ───────────────────────────────────────────────────────────────

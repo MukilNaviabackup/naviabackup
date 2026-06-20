@@ -482,11 +482,13 @@ router.post('/place-squareoff', async (req, res) => {
             .query(`INSERT INTO squareoff_orders
                     (order_id, ucc, exchange, segment, symbol, quantity, side,
                      status, client_name, placed_by, dealer_id,
-                     expiry_date, strike_price, option_type, placed_at)
+                     expiry_date, strike_price, option_type, placed_at,
+                     executed_qty, remaining_qty)
                     VALUES
                     (@orderId, @ucc, @exchange, @segment, @symbol, @quantity, @side,
                      'ORDER_RECEIVED', @clientName, @placedBy, @dealerId,
-                     @expiry, @strike, @optionType, GETDATE())`);
+                     @expiry, @strike, @optionType, GETDATE(),
+                     0, @quantity)`);
 
         return res.json({ success: true, orderId, message: 'Square-off placed successfully.' });
 

@@ -104,11 +104,13 @@ router.post('/squareoff', authenticate, async (req, res) => {
             .query(`INSERT INTO squareoff_orders
                         (order_id, ucc, exchange, segment, symbol, quantity,
                          order_type, side, status, placed_at, rms_notified,
-                         placed_by, dealer_id, expiry_date, strike_price, option_type)
+                         placed_by, dealer_id, expiry_date, strike_price, option_type,
+                         executed_qty, remaining_qty)
                     VALUES
                         (@orderId, @ucc, @exchange, @segment, @symbol, @qty,
                          'MARKET', @side, 'ORDER_RECEIVED', GETDATE(), 0,
-                         @placedBy, @dealerId, @expiryDate, @strikePrice, @optType)`);
+                         @placedBy, @dealerId, @expiryDate, @strikePrice, @optType,
+                         0, @qty)`);
 
         console.log(`[Orders] Step 5: order inserted orderId=${orderId}`);
         // ── Update positions table (non-critical) ─────────────────────────
