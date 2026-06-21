@@ -96,7 +96,34 @@ router.post('/login/initiate', async (req, res) => {
         // Check force retrigger (sent as separate field)
         const forceNew = !!(req.body.force);
 
-        // Reuse existing valid session (unless force=1)
+        // ── One-OTP-per-calendar-day rule ───────────────────────────────────
+        // If this dealer already successfully verified an OTP today (is_used=1,
+        // session not yet expired), skip OTP entirely and log them straight in.
+        if (!forceNew) {
+            const alreadyVerified = await pool.request()
+                .input('dealerId', sql.VarChar(10), String(dealer.dealer_id).trim())
+                .query(`SELECT TOP 1 session_id FROM dealer_otp_sessions
+                        WHERE dealer_id=@dealerId AND is_used=1 AND expires_at>GETDATE()
+                        ORDER BY expires_at DESC`);
+
+            if (alreadyVerified.recordset.length > 0) {
+                const dealerIdValue = String(dealer.dealer_id).trim();
+                const token = jwt.sign(
+                    { dealerId: dealerIdValue, name: dealer.full_name, role: 'DEALER' },
+                    process.env.JWT_SECRET, { expiresIn: '12h' }
+                );
+                writeLog('DEALER_LOGIN_SUCCESS', dealer.full_name, 'DEALER', null, ip, `Dealer ${dealerIdValue} re-logged in (already verified today, no OTP required)`, 'SUCCESS');
+                console.log(`Dealer already verified today, skipping OTP: ${dealerIdValue}`);
+                return res.json({
+                    success: true,
+                    alreadyVerifiedToday: true,
+                    token,
+                    dealer: { dealer_id: dealerIdValue, name: dealer.full_name }
+                });
+            }
+        }
+
+        // Reuse existing valid (unused) session (unless force=1)
         if (!forceNew) {
             const existingSession = await pool.request()
                 .input('dealerId', sql.VarChar(10), String(dealer.dealer_id).trim())

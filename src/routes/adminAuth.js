@@ -99,7 +99,35 @@ router.post('/login/initiate', async (req, res) => {
         // Check if force retrigger requested (sent as separate field)
         const forceNew = !!(req.body.force);
 
-        // Reuse existing valid session (unless force=1)
+        // ── One-OTP-per-calendar-day rule ───────────────────────────────────
+        // If this admin already successfully verified an OTP today (is_used=1,
+        // session not yet expired), skip OTP entirely and log them straight in.
+        // Confirmed tradeoff: after the first OTP today, username alone is
+        // sufficient for the rest of the day — no password exists in this flow.
+        if (!forceNew) {
+            const alreadyVerified = await pool.request()
+                .input('adminId', sql.Int, admin.admin_id)
+                .query(`SELECT TOP 1 session_id FROM admin_otp_sessions
+                        WHERE admin_id=@adminId AND is_used=1 AND expires_at>GETDATE()
+                        ORDER BY expires_at DESC`);
+
+            if (alreadyVerified.recordset.length > 0) {
+                const token = jwt.sign(
+                    { adminId: admin.admin_id, username: admin.username || username.toLowerCase().trim(), role: admin.role, name: admin.full_name },
+                    process.env.JWT_SECRET, { expiresIn: '12h' }
+                );
+                writeLog('ADMIN_LOGIN_SUCCESS', admin.full_name, 'ADMIN', null, ip, `Admin ${username} re-logged in (already verified today, no OTP required)`, 'SUCCESS');
+                console.log(`Admin already verified today, skipping OTP: ${username}`);
+                return res.json({
+                    success: true,
+                    alreadyVerifiedToday: true,
+                    token,
+                    admin: { username: admin.username || username.toLowerCase().trim(), name: admin.full_name, role: admin.role }
+                });
+            }
+        }
+
+        // Reuse existing valid (unused) session (unless force=1)
         if (!forceNew) {
             const existingSession = await pool.request()
                 .input('adminId', sql.Int, admin.admin_id)
