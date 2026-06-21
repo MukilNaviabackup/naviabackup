@@ -313,11 +313,14 @@ router.post('/upload', adminAuthenticate, upload.single('bf_file'), async (req, 
 });
 
 // ─── GET /api/bf/positions ────────────────────────────────────────────────────
-// Returns latest biz_date records per exchange for the logged-in client.
+// Returns TODAY's (IST) B/F records per exchange for the logged-in client.
 // total_open_qty is stored in LOTS. Positive = LONG, Negative = SHORT.
-// FIX: Removed AND latest.max_date >= CAST(GETDATE() AS DATE)
-//      Old filter excluded past biz_date files (e.g. 05 Jun upload not shown today).
-//      Now returns the latest available biz_date per exchange regardless of upload day.
+//
+// Whatever file is uploaded is accepted as-is (no rejection logic here).
+// Data is shown only for today's IST calendar date and flushes out
+// automatically at midnight IST (00:00, i.e. the moment 11:59 PM IST ends).
+// GETDATE() on Azure SQL returns UTC, so we add 5:30 before taking the date —
+// without this offset the flip happens at 5:30 AM IST instead of midnight IST.
 router.get('/positions', async (req, res) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -346,15 +349,8 @@ router.get('/positions', async (req, res) => {
                     bf.lot_size        AS resolved_lot_size,
                     bf.settlement_price, bf.biz_date, bf.file_source
                 FROM bf_positions bf
-                INNER JOIN (
-                    SELECT exchange, MAX(biz_date) AS max_date
-                    FROM bf_positions
-                    WHERE ucc = @ucc
-                    GROUP BY exchange
-                ) latest
-                    ON  bf.exchange = latest.exchange
-                    AND bf.biz_date = latest.max_date
                 WHERE bf.ucc = @ucc
+                AND   bf.biz_date = CAST(DATEADD(MINUTE, 330, GETDATE()) AS DATE)
                 ORDER BY bf.exchange, bf.instrument_type, bf.symbol, bf.expiry_date, bf.strike_price
             `);
 

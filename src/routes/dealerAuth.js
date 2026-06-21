@@ -360,7 +360,7 @@ router.post('/client-data', async (req, res) => {
             pool.request().input('ucc', sql.VarChar(20), ucc.trim())
                 .query(`SELECT * FROM bf_positions
                         WHERE ucc = @ucc
-                        AND biz_date = (SELECT MAX(biz_date) FROM bf_positions WHERE ucc = @ucc)
+                        AND biz_date = CAST(DATEADD(MINUTE, 330, GETDATE()) AS DATE)
                         ORDER BY instrument_type, symbol`)
                 .catch(() => ({ recordset: [] })),
         ]);

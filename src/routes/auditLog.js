@@ -407,8 +407,12 @@ router.get('/client-activity', validateAuditToken, async (req, res) => {
                 .query(`SELECT * FROM orders WHERE ucc = @ucc AND CAST(placed_at AS DATE) = @date ORDER BY placed_at DESC`),
             pool.request().input('ucc', sql.VarChar(20), ucc).input('date', sql.Date, new Date(date))
                 .query(`SELECT * FROM day_positions WHERE ucc = @ucc AND trade_date = @date ORDER BY instrument_type, symbol`),
-            pool.request().input('ucc', sql.VarChar(20), ucc)
-                .query(`SELECT * FROM bf_positions WHERE ucc = @ucc AND biz_date = (SELECT MAX(biz_date) FROM bf_positions WHERE ucc = @ucc) ORDER BY instrument_type, symbol`)
+            // FIX: was always pulling the MOST RECENT biz_date ever uploaded,
+            // ignoring the @date being looked up — inconsistent with orders
+            // and day_positions above, which both correctly use @date.
+            // Now filters by the same requested date as the rest of this route.
+            pool.request().input('ucc', sql.VarChar(20), ucc).input('date', sql.Date, new Date(date))
+                .query(`SELECT * FROM bf_positions WHERE ucc = @ucc AND biz_date = @date ORDER BY instrument_type, symbol`)
         ]);
 
         return res.json({
