@@ -320,7 +320,12 @@ router.get('/:date/otp', basicAuth, async (req, res) => {
                     ORDER BY sl.created_at DESC`);
 
         const rows = result.recordset.map(l => {
-            // Parse delivery details from details field
+            // Parse delivery details from details field.
+            // CLIENT rows: otpService.js writes a follow-up log with real
+            // "SMS:true/false | Email:true/false" markers once delivery
+            // completes (client OTP uses both SMS and email).
+            // ADMIN/DEALER rows: email-only, no SMS path exists at all -
+            // adminAuth.js/dealerAuth.js now write "Email:true/false".
             const det   = l.details || '';
             const sms   = det.includes('SMS:true')   ? '<span class="badge b-green">SMS ✓</span>'   : det.includes('SMS:false')   ? '<span class="badge b-red">SMS ✗</span>'   : '—';
             const email = det.includes('Email:true') ? '<span class="badge b-green">Email ✓</span>' : det.includes('Email:false') ? '<span class="badge b-red">Email ✗</span>' : '—';
@@ -342,14 +347,14 @@ router.get('/:date/otp', basicAuth, async (req, res) => {
         const content = `
             <div class="info-bar">📱 OTP delivery log for <b>${date}</b> · ${result.recordset.length} OTPs sent</div>
             <div class="card">
-              <div class="card-hdr">OTP events — SMS · Email · WhatsApp delivery status</div>
+              <div class="card-hdr">OTP events — SMS · Email delivery status</div>
               ${result.recordset.length===0 ? '<div class="empty">No OTP events</div>' : `
               <div style="overflow-x:auto">
               <table>
                 <thead><tr>
                   <th>Time (IST)</th><th>Type</th><th>Actor</th><th>UCC</th>
                   <th>Client name</th><th>Mobile</th><th>Email</th>
-                  <th>SMS</th><th>Email</th><th>Details</th><th>Status</th>
+                  <th>SMS</th><th>Email Status</th><th>Details</th><th>Status</th>
                 </tr></thead>
                 <tbody>${rows}</tbody>
               </table></div>`}

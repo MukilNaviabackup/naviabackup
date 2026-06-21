@@ -155,8 +155,10 @@ router.post('/login/initiate', async (req, res) => {
             .input('expiresAt', sql.DateTime, expiresAt)
             .query('INSERT INTO dealer_otp_sessions (session_id,dealer_id,otp_hash,expires_at,is_used,attempt_count) VALUES (@sessionId,@dealerId,@otpHash,@expiresAt,0,0)');
 
-        writeLog('DEALER_OTP_SENT', dealer.full_name, 'DEALER', null, ip, `OTP sent to ${dealer.email} for dealer ${dealer.dealer_id}`, 'SUCCESS');
-        sendDealerOTPEmail(dealer.email, dealer.full_name, otp, dealer.dealer_id);
+        const emailSent = await sendDealerOTPEmail(dealer.email, dealer.full_name, otp, dealer.dealer_id);
+        writeLog('DEALER_OTP_SENT', dealer.full_name, 'DEALER', null, ip,
+            `OTP sent to ${dealer.email} for dealer ${dealer.dealer_id} | Email:${emailSent}`,
+            emailSent ? 'SUCCESS' : 'FAILED');
         console.log(`Dealer OTP for ${dealer_id}: ${otp}`);
 
         return res.json({ success: true, sessionId, email: dealer.email.replace(/(.{2})(.*)(@.*)/, '$1***$3'), message: 'OTP sent to registered email.' });

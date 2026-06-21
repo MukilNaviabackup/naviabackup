@@ -160,8 +160,10 @@ router.post('/login/initiate', async (req, res) => {
             .query(`INSERT INTO admin_otp_sessions (session_id,admin_id,otp_hash,expires_at,is_used,attempt_count)
                     VALUES (@sessionId,@adminId,@otpHash,@expiresAt,0,0)`);
 
-        writeLog('ADMIN_OTP_SENT', admin.full_name, 'ADMIN', null, ip, `OTP sent to ${admin.email}`, 'SUCCESS');
-        sendAdminOTPEmail(admin.email, admin.full_name, otp);
+        const emailSent = await sendAdminOTPEmail(admin.email, admin.full_name, otp);
+        writeLog('ADMIN_OTP_SENT', admin.full_name, 'ADMIN', null, ip,
+            `OTP sent to ${admin.email} | Email:${emailSent}`,
+            emailSent ? 'SUCCESS' : 'FAILED');
         console.log(`Admin OTP for ${username}: ${otp}`);
 
         return res.json({ success: true, sessionId, email: admin.email.replace(/(.{2})(.*)(@.*)/, '$1***$3'), message: 'OTP sent to registered email.', reused: false });
