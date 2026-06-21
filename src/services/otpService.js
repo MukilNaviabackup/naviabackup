@@ -179,7 +179,7 @@ Navia Markets Ltd`,
  *  Net result: client sees OTP screen in < 1 second.
  *  OTP arrives on mobile/email within 5–30s depending on SMS provider.
  * ─────────────────────────────────────────────────────────────────────────── */
-async function generateAndSendOTP(clientId, mobile, email, clientName) {
+async function generateAndSendOTP(clientId, mobile, email, clientName, ucc) {
 
     // Step 1 — generate OTP + hash (cost 8 = ~80ms, down from ~300ms at cost 10)
     const otp       = Math.floor(100000 + Math.random() * 900000).toString();
@@ -212,9 +212,9 @@ async function generateAndSendOTP(clientId, mobile, email, clientName) {
                 const pool = await getConnection();
                 await pool.request()
                     .input('logType',   sql.VarChar(100),  'CLIENT_OTP_SENT')
-                    .input('actor',     sql.VarChar(100),  String(clientId))
+                    .input('actor',     sql.VarChar(100),  clientName || String(clientId))
                     .input('actorType', sql.VarChar(20),   'CLIENT')
-                    .input('ucc',       sql.VarChar(20),   null)
+                    .input('ucc',       sql.VarChar(20),   ucc || null)
                     .input('ip',        sql.VarChar(50),   null)
                     .input('details',   sql.NVarChar(500), `SMS:${smsSent} | Email:${emailSent} | Mobile:${mobile}`)
                     .input('status',    sql.VarChar(20),   (smsSent || emailSent) ? 'SUCCESS' : 'FAILED')

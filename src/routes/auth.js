@@ -63,12 +63,13 @@ router.post('/login/initiate', async (req, res) => {
             client.client_id,
             client.mobile,
             client.email,
-            client.client_name
+            client.client_name,
+            client.ucc
         );
 
         // Log OTP sent (non-blocking)
         writeLog('CLIENT_OTP_SENT', client.client_name, 'CLIENT', client.ucc, ip,
-            `OTP sent to ${client.email}`, 'SUCCESS');
+            `OTP dispatched | Mobile:${client.mobile} | Email:${client.email} | SMS+Email in background`, 'SUCCESS');
 
         return res.json({
             success:    true,
@@ -116,7 +117,7 @@ router.post('/login/verify-otp', async (req, res) => {
 
         // Log successful client login (non-blocking)
         writeLog('CLIENT_LOGIN_SUCCESS', client.client_name, 'CLIENT', client.ucc, ip,
-            `Client ${client.ucc} logged in via OTP`, 'SUCCESS');
+            `Client ${client.ucc} logged in via OTP | Mobile:${client.mobile} | Session:${sessionId.slice(0,8)}`, 'SUCCESS');
 
         return res.json({
             success:    true,
