@@ -111,7 +111,7 @@ function makeNeatFORow(serial, side, symbol, expiry, strikePrice, optionType, qt
         memberCode.padEnd(12),        // Col 19: Member code
         '2 ',                         // Col 20: Exchange (2=NSE)
         ucc.padEnd(10),               // Col 21: Client UCC
-        '                         ',  // Col 22: Blank
+        '                        ',   // Col 22: Blank
         '0 ',                         // Col 23: Disclosed qty
         '                ',           // Col 24: Blank
         '            ',               // Col 25: Blank
