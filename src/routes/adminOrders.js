@@ -126,6 +126,25 @@ function makeNeatFORow(serial, side, symbol, expiry, strikePrice, optionType, qt
 router.get('/diag/neat-fo-test', (req, res) => {
     const testRow = makeNeatFORow(1, 'SELL', 'NIFTY', '2026-06-23', '25400', 'CE', 1, '88707169', '07708', 65);
     const cols = testRow.split(',');
+
+    // Also read this file's OWN source directly from disk, right now, to prove
+    // with zero ambiguity what code is actually running - not what we assume
+    // is deployed. This bypasses every layer of doubt about caching/deploy.
+    let sourceSnippet = null;
+    try {
+        const fs = require('fs');
+        const selfSource = fs.readFileSync(__filename, 'utf8');
+        const defIndex = selfSource.indexOf('function makeNeatFORow');
+        const callIndex = selfSource.indexOf('router.post(\'/orders/generate-file\'');
+        sourceSnippet = {
+            file_path: __filename,
+            function_definition_excerpt: selfSource.slice(defIndex, defIndex + 400),
+            generate_file_route_excerpt: selfSource.slice(callIndex, callIndex + 1200),
+        };
+    } catch (e) {
+        sourceSnippet = { error: e.message };
+    }
+
     res.json({
         full_row: testRow,
         col_1_order_type: cols[1],
@@ -136,7 +155,8 @@ router.get('/diag/neat-fo-test', (req, res) => {
         col_16_price_blank: cols[16],
         col_16_length: cols[16] ? cols[16].length : 0,
         col_22_blank_length: cols[22] ? cols[22].length : 0,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        source_proof: sourceSnippet
     });
 });
 
