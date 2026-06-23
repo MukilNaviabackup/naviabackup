@@ -118,6 +118,28 @@ function makeNeatFORow(serial, side, symbol, expiry, strikePrice, optionType, qt
     ].join(',');
 }
 
+// ── TEMPORARY DIAGNOSTIC ROUTE ────────────────────────────────────────────────
+// No auth, read-only, calls makeNeatFORow directly with fixed test values.
+// Lets us verify exactly what code is live on the server via a plain browser
+// visit - no Kudu/console needed. Touches nothing else. Safe to remove once
+// the FAO file format mismatch is resolved.
+router.get('/diag/neat-fo-test', (req, res) => {
+    const testRow = makeNeatFORow(1, 'SELL', 'NIFTY', '2026-06-23', '25400', 'CE', 1, '88707169', '07708', 65);
+    const cols = testRow.split(',');
+    res.json({
+        full_row: testRow,
+        col_1_order_type: cols[1],
+        col_1_is_letter_O: cols[1] === 'O',
+        col_1_is_digit_0: cols[1] === '0',
+        col_13_blank: cols[13],
+        col_13_length: cols[13] ? cols[13].length : 0,
+        col_16_price_blank: cols[16],
+        col_16_length: cols[16] ? cols[16].length : 0,
+        col_22_blank_length: cols[22] ? cols[22].length : 0,
+        timestamp: new Date().toISOString()
+    });
+});
+
 // BSE BOLT CM format
 function makeBoltCMRow(serial, side, symbol, qty, ucc, memberCode) {
     const trans = side.toUpperCase() === 'BUY' ? '1' : '2';
