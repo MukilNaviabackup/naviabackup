@@ -377,13 +377,9 @@ router.post('/client-data', async (req, res) => {
                 .catch(() => ({ recordset: [] })),
             pool.request()
                 .input('ucc', sql.VarChar(20), ucc.trim())
+                .input('tradeDate', sql.Date, new Date(tradeDate))
                 .query(`SELECT * FROM day_positions
-                        WHERE ucc = @ucc 
-                        AND trade_date = (
-                            SELECT MAX(trade_date) FROM day_positions 
-                            WHERE ucc = @ucc
-                            AND trade_date >= CAST(DATEADD(day,-1,GETDATE()) AS DATE)
-                        )
+                        WHERE ucc = @ucc AND trade_date = @tradeDate
                         ORDER BY instrument_type, symbol`)
                 .catch(() => ({ recordset: [] })),
             pool.request().input('ucc', sql.VarChar(20), ucc.trim())
