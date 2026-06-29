@@ -43,19 +43,18 @@ function makeNeatCMRow(serial, side, symbol, qty, ucc, memberCode) {
 }
 
 // ── Lot size lookup (NEAT FO requires correct lot size in Col 17) ────────────
-const LOT_SIZES = {
-    'NIFTY': 75, 'BANKNIFTY': 35, 'FINNIFTY': 65, 'MIDCPNIFTY': 120,
-    'SENSEX': 10, 'BANKEX': 15,
-    'RELIANCE': 250, 'TCS': 150, 'INFY': 300, 'HDFCBANK': 550,
-    'ICICIBANK': 700, 'SBIN': 1500, 'BAJFINANCE': 125,
-    'WIPRO': 1500, 'HCLTECH': 700, 'LT': 300, 'AXISBANK': 1200,
-    'TATAMOTORS': 1400, 'TATASTEEL': 5500, 'ADANIENT': 600,
-    'ONGC': 3850, 'POWERGRID': 4700, 'NTPC': 4500,
-};
-function getLotSize(symbol) {
-    if (!symbol) return 75;
+// Previously a hardcoded map - which is exactly how NIFTY's lot size silently
+// went stale (75 instead of the correct, current 65) until proven against real
+// orders and the lot_size_master table. Now reads the live table instead, the
+// same one the Python DropCopy sync service already keeps up to date via
+// /api/dropcopy/refresh-lots after every successful sync - so this can't
+// drift out of sync again for any symbol, not just NIFTY.
+// lotSizeMap is built once per request from lot_size_master (see /orders/
+// generate-file below) and passed in here rather than queried per-row.
+function getLotSize(symbol, lotSizeMap) {
+    if (!symbol) return 1;
     const base = symbol.toUpperCase().trim().split(/[\s@0-9]/)[0];
-    return LOT_SIZES[base] || 1;
+    return (lotSizeMap && lotSizeMap[base]) || 1;
 }
 
 // NSE NEAT FO Basket — options and futures
@@ -212,7 +211,7 @@ function makeBoltFORow(serial, side, symbol, expiry, strikePrice, optionType, qt
 
     const strike  = strikePrice ? String(Math.round(parseFloat(strikePrice))).padEnd(10) : '          ';
     const optType = isFO ? optionType : '';
-    const lot     = String(lotSize || getLotSize(symbol)).padEnd(9);
+    const lot     = String(lotSize || 1).padEnd(9);
 
     // BSE BOLT FO — 26 columns (same structure as NSE NEAT FO)
     return [
@@ -380,6 +379,15 @@ router.post('/orders/generate-file', adminAuthenticate, async (req, res) => {
         let filename = '';
 
         if (exchange === 'NSE') {
+            // Live lot sizes from lot_size_master - replaces the old hardcoded
+            // LOT_SIZES map. Same table the Python DropCopy sync service keeps
+            // current automatically; see getLotSize() above for why this matters.
+            const lotResult = await pool.request()
+                .input('exchange', sql.VarChar(10), 'NSE')
+                .query(`SELECT symbol, lot_size FROM lot_size_master WHERE exchange = @exchange AND lot_size > 1`);
+            const lotSizeMap = {};
+            lotResult.recordset.forEach(r => { lotSizeMap[r.symbol.toUpperCase()] = r.lot_size; });
+
             const cmOrders = orders.filter(o => o.segment === 'CM');
             const foOrders = orders.filter(o => o.segment === 'FO');
 
@@ -391,7 +399,7 @@ router.post('/orders/generate-file', adminAuthenticate, async (req, res) => {
             } else if (foOrders.length > 0 && cmOrders.length === 0) {
                 filename = basketFilename('BasketFO');
                 foOrders.forEach((o, i) => {
-                    csvRows.push(makeNeatFORow(i + 1, o.side, o.symbol, o.expiry_date, o.strike_price, o.option_type, o.quantity, o.ucc, '07708', getLotSize(o.symbol)));
+                    csvRows.push(makeNeatFORow(i + 1, o.side, o.symbol, o.expiry_date, o.strike_price, o.option_type, o.quantity, o.ucc, '07708', getLotSize(o.symbol, lotSizeMap)));
                 });
             } else {
                 // Mixed CM+FO — separate into two files; send CM as primary download
@@ -402,7 +410,7 @@ router.post('/orders/generate-file', adminAuthenticate, async (req, res) => {
                 });
                 // FO rows appended after CM
                 foOrders.forEach(o => {
-                    csvRows.push(makeNeatFORow(serial++, o.side, o.symbol, o.expiry_date, o.strike_price, o.option_type, o.quantity, o.ucc, '07708', getLotSize(o.symbol)));
+                    csvRows.push(makeNeatFORow(serial++, o.side, o.symbol, o.expiry_date, o.strike_price, o.option_type, o.quantity, o.ucc, '07708', getLotSize(o.symbol, lotSizeMap)));
                 });
             }
         } else if (exchange === 'BSE') {
