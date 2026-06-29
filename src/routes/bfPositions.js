@@ -56,6 +56,21 @@ function extractDateFromFilename(filename) {
     return null;
 }
 
+// B/F always represents positions carried forward TO today's session — there is
+// no real scenario where a B/F upload should be dated anything other than the
+// actual day it's uploaded. Previously biz_date was parsed from the filename
+// (e.g. "..._25-06-26..."), which silently files the data under whatever date
+// happens to appear in the filename - if that date doesn't match the real
+// calendar day (a stale export name, a backfill, a typo), the upload succeeds
+// but becomes invisible to both Client and Dealer views, since both correctly
+// only ever query for today's biz_date. Using the real server date removes
+// this entire class of mismatch.
+function getISTTodayDate() {
+    const now    = new Date();
+    const istNow = new Date(now.getTime() + (5.5 * 60 * 60 * 1000));
+    return istNow.toISOString().slice(0, 10);
+}
+
 function parseDate(val) {
     if (!val) return null;
     val = val.toString().trim();
@@ -188,7 +203,7 @@ router.post('/upload', adminAuthenticate, upload.single('bf_file'), async (req, 
 
     try {
         const pool    = await getConnection();
-        const bizDate = extractDateFromFilename(filename) || new Date().toISOString().slice(0,10);
+        const bizDate = getISTTodayDate();
 
         const lines = readRawLines(req.file.path);
         console.log(`[BF Upload] ${filename} | Exchange: ${fmt.exchange} | BizDate: ${bizDate} | Lines: ${lines.length}`);
