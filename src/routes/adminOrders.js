@@ -387,7 +387,6 @@ router.post('/orders/generate-file', adminAuthenticate, async (req, res) => {
                 .query(`SELECT symbol, lot_size FROM lot_size_master WHERE exchange = @exchange AND lot_size > 1`);
             const lotSizeMap = {};
             lotResult.recordset.forEach(r => { lotSizeMap[r.symbol.toUpperCase()] = r.lot_size; });
-            console.log('[LOTSIZE DEBUG] lotSizeMap:', JSON.stringify(lotSizeMap));
 
             const cmOrders = orders.filter(o => o.segment === 'CM');
             const foOrders = orders.filter(o => o.segment === 'FO');
@@ -530,6 +529,22 @@ router.post('/orders/generate-file', adminAuthenticate, async (req, res) => {
     } catch (err) {
         console.error('Generate file error:', err);
         return res.status(500).json({ error: 'Failed to generate file.' });
+    }
+});
+
+// Get current NSE lot sizes (for frontend file-generation logic) - reads the
+// same lot_size_master table the Python DropCopy sync service keeps current,
+// so the frontend's NEAT FO basket builder no longer needs its own hardcoded
+// copy that can silently go stale (see NIFTY 75->65 incident).
+router.get('/lot-sizes', adminAuthenticate, async (req, res) => {
+    try {
+        const pool   = await getConnection();
+        const result = await pool.request()
+            .input('exchange', sql.VarChar(10), 'NSE')
+            .query(`SELECT symbol, lot_size FROM lot_size_master WHERE exchange = @exchange AND lot_size > 1`);
+        return res.json({ success: true, lotSizes: result.recordset });
+    } catch (err) {
+        return res.status(500).json({ error: 'Failed to fetch lot sizes.' });
     }
 });
 
