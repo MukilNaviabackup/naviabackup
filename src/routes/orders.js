@@ -153,7 +153,7 @@ router.get('/my-orders', authenticate, async (req, res) => {
             .input('ucc', sql.VarChar, ucc)
             .query(`SELECT
                         order_id, ucc, exchange, segment, symbol,
-                        quantity, side, order_type, status,
+                        quantity, executed_qty, side, order_type, status,
                         placed_at, traded_at, trade_price,
                         placed_by, dealer_id,
                         expiry_date, strike_price, option_type,
