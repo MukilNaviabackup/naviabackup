@@ -387,6 +387,7 @@ router.post('/orders/generate-file', adminAuthenticate, async (req, res) => {
                 .query(`SELECT symbol, lot_size FROM lot_size_master WHERE exchange = @exchange AND lot_size > 1`);
             const lotSizeMap = {};
             lotResult.recordset.forEach(r => { lotSizeMap[r.symbol.toUpperCase()] = r.lot_size; });
+            console.log('[LOTSIZE DEBUG] lotSizeMap:', JSON.stringify(lotSizeMap));
 
             const cmOrders = orders.filter(o => o.segment === 'CM');
             const foOrders = orders.filter(o => o.segment === 'FO');
