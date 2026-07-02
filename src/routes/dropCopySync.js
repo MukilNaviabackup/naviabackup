@@ -293,8 +293,26 @@ router.post('/log', validateSyncKey, async (req, res) => {
 });
 
 router.get('/sync-logs', async (req, res) => {
+    // Accept either the server-side sync key (used by Python services)
+    // OR a valid admin JWT Bearer token (used by the SyncMonitor admin panel).
+    // The sync key must never be sent to the browser, so the admin panel
+    // authenticates with its normal JWT instead.
     const key = req.headers['x-sync-key'] || req.query.key;
-    if (!key || key !== process.env.SYNC_API_KEY) {
+    let isAuthorized = key && key === process.env.SYNC_API_KEY;
+
+    if (!isAuthorized) {
+        const authHeader = req.headers['authorization'];
+        const token = authHeader && authHeader.split(' ')[1];
+        if (token) {
+            try {
+                const jwt     = require('jsonwebtoken');
+                const decoded = jwt.verify(token, process.env.JWT_SECRET);
+                isAuthorized  = decoded.role === 'ADMIN' || decoded.role === 'SUPERADMIN';
+            } catch (_) {}
+        }
+    }
+
+    if (!isAuthorized) {
         return res.status(401).json({ error: 'Unauthorized.' });
     }
     try {
