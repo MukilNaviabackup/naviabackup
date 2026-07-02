@@ -28,21 +28,27 @@ async function reconcile() {
         pool = await getConnection();
 
         // Quick count — skip if no open orders (saves DB connections on idle periods)
+        // Only process FILE_GENERATED and PARTIALLY_TRADED orders — NOT ORDER_RECEIVED.
+        // Reason: ORDER_RECEIVED means the admin has not yet generated and sent the basket
+        // file to the exchange terminal. If we reconcile ORDER_RECEIVED orders, we would
+        // falsely match positions that came from the client's own trading application
+        // (not from a Navia Backup square-off), triggering incorrect trade notifications.
+        // Reconciliation only makes sense AFTER file_generated = 1 (file sent to terminal).
         const cntRes = await pool.request().query(
             `SELECT COUNT(*) AS cnt FROM squareoff_orders
-             WHERE status IN ('ORDER_RECEIVED','FILE_GENERATED','PARTIALLY_TRADED')
+             WHERE status IN ('FILE_GENERATED','PARTIALLY_TRADED')
              AND placed_at >= CAST(GETDATE()-1 AS DATE)`
         );
         if (!cntRes.recordset[0].cnt) return;
 
-        // Step 1: Get all open orders
+        // Step 1: Get all file-generated open orders (not ORDER_RECEIVED)
         const openOrders = await pool.request().query(`
             SELECT order_id, ucc, exchange, segment, symbol, isin,
                    side, quantity, executed_qty, remaining_qty,
                    status, placed_at,
                    expiry_date, strike_price, option_type
             FROM squareoff_orders
-            WHERE status IN ('ORDER_RECEIVED','FILE_GENERATED','PARTIALLY_TRADED')
+            WHERE status IN ('FILE_GENERATED','PARTIALLY_TRADED')
             AND placed_at >= CAST(GETDATE()-1 AS DATE)
         `);
 
@@ -77,16 +83,7 @@ async function reconcileOrder(pool, order) {
     } else if (isCM) {
         executedQty = await getCMExecutedQty(pool, order);
     } else {
-        // MCX FO orders: same day_positions table, same FO matching logic.
-        // MCX segment is 'FO', exchange is 'MCX' — getFOExecutedQty matches
-        // on UCC + symbol + exchange + expiry + strike + option_type, so it
-        // correctly distinguishes MCX positions from NSE/BSE ones via exchange.
-        const isMCX = (order.exchange || '').toUpperCase() === 'MCX';
-        if (isMCX) {
-            executedQty = await getFOExecutedQty(pool, order);
-        } else {
-            return; // Unknown segment/exchange — skip
-        }
+        return; // MCX - skip for now
     }
 
     const requestedQty  = Number(order.quantity)     || 0;
