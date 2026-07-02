@@ -77,7 +77,16 @@ async function reconcileOrder(pool, order) {
     } else if (isCM) {
         executedQty = await getCMExecutedQty(pool, order);
     } else {
-        return; // MCX - skip for now
+        // MCX FO orders: same day_positions table, same FO matching logic.
+        // MCX segment is 'FO', exchange is 'MCX' — getFOExecutedQty matches
+        // on UCC + symbol + exchange + expiry + strike + option_type, so it
+        // correctly distinguishes MCX positions from NSE/BSE ones via exchange.
+        const isMCX = (order.exchange || '').toUpperCase() === 'MCX';
+        if (isMCX) {
+            executedQty = await getFOExecutedQty(pool, order);
+        } else {
+            return; // Unknown segment/exchange — skip
+        }
     }
 
     const requestedQty  = Number(order.quantity)     || 0;
