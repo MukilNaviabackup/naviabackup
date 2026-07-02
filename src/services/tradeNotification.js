@@ -187,7 +187,7 @@ async function sendTradeWhatsApp(client, order, statusLabel) {
                 parameters: [
                     { type: 'text', text: ctx.side },                                       // {1} BUY/SELL
                     { type: 'text', text: `${ctx.exchange} ${ctx.tradingSymbol}` },         // {2} exchange + scrip
-                    { type: 'text', text: String(ctx.executedQty) },                        // {3} quantity
+                    { type: 'text', text: String(ctx.requestedQty) },                       // {3} qty placed by client (not recon-computed executedQty which can reflect total day position)
                     { type: 'text', text: ctx.tradePrice },                                 // {4} trade price
                 ]
             }]
