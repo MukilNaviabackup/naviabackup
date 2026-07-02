@@ -4,6 +4,7 @@ const authenticate = require('../middleware/authenticate');
 const { getConnection, sql } = require('../config/database');
 const { v4: uuidv4 } = require('uuid');
 const { sendRMSAlert } = require('../services/notificationService');
+const { queueRMSEmailAlert } = require('../services/rmsEmailAlert');
 
 // Place a square-off order
 router.post('/squareoff', authenticate, async (req, res) => {
@@ -137,6 +138,14 @@ router.post('/squareoff', authenticate, async (req, res) => {
             quantity, side, expiry_date, strike_price, option_type,
             dealerId: dealerIdVal, placedBy: placedByVal
         }).catch(err => console.error('[Orders] RMS alert (non-critical):', err.message));
+
+        // Queue RMS email alert with basket file attachment — non-blocking.
+        // Uses a 2-second debounce so Square Off All (multiple orders placed
+        // within milliseconds) results in one batched email, not one per order.
+        queueRMSEmailAlert({
+            ucc, exchange, segment, symbol, quantity, side,
+            expiry_date, strike_price, option_type,
+        });
 
     } catch (err) {
         console.error('Square-off error:', err.message);
