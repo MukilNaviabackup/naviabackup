@@ -39,11 +39,6 @@ const BCC_LIST  = [
     'elamukil@navia.co.in',
 ];
 
-// ── Debounce buffer ───────────────────────────────────────────────────────────
-let _buffer      = [];
-let _timer       = null;
-const DEBOUNCE_MS = 2000;   // 2 seconds -- collects Square Off All bursts naturally
-
 // ── Formatting helpers ────────────────────────────────────────────────────────
 function pad(val, len) { return String(val || '').padEnd(len, ' '); }
 
@@ -347,17 +342,11 @@ async function sendBatchEmail(orders) {
 /**
  * queueRMSEmailAlert(orderDetails)
  *
- * Call once per order placed. Accumulates orders over a 2-second window,
- * then fires one batched email with all relevant basket files attached.
- *
- * This means:
- *   - Square Off All (5 orders in ~100ms) -> one email, up to 3 attachments
- *   - Single order                         -> one email, one attachment
- *
+ * Sends an email immediately when an order is placed.
  * Always non-blocking (fire and forget).
  */
 function queueRMSEmailAlert(orderDetails) {
-    _buffer.push({
+    const order = {
         ucc:          orderDetails.ucc,
         symbol:       orderDetails.symbol,
         exchange:    (orderDetails.exchange  || '').toUpperCase(),
@@ -367,19 +356,11 @@ function queueRMSEmailAlert(orderDetails) {
         expiry_date:  orderDetails.expiry_date  || null,
         strike_price: orderDetails.strike_price || null,
         option_type:  orderDetails.option_type  || null,
-    });
-    console.log(`[RMSEmail] Queued: ${orderDetails.symbol} UCC:${orderDetails.ucc} | Buffer: ${_buffer.length}`);
-
-    // Reset debounce timer — fires 2s after LAST order in the burst
-    if (_timer) clearTimeout(_timer);
-    _timer = setTimeout(() => {
-        const batch = [..._buffer];
-        _buffer     = [];
-        _timer      = null;
-        sendBatchEmail(batch).catch(e =>
-            console.error('[RMSEmail] Batch flush error:', e.message)
-        );
-    }, DEBOUNCE_MS);
+    };
+    console.log(`[RMSEmail] Sending alert: ${order.symbol} ${order.exchange}/${order.segment} UCC:${order.ucc}`);
+    sendBatchEmail([order]).catch(e =>
+        console.error('[RMSEmail] Send error:', e.message)
+    );
 }
 
 module.exports = { queueRMSEmailAlert };
