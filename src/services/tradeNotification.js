@@ -83,6 +83,9 @@ function buildNotificationContext(order, client, statusLabel) {
         statusLabel,                                  // 'Fully Traded' | 'Partially Traded'
         tradedAt:        fmtDate(order.traded_at || new Date()),
         orderId:         order.order_id,
+        // trade_price is set when admin manually confirms price via update-status,
+        // or auto-populated if available from DropCopy reconciliation.
+        tradePrice:      order.trade_price ? Number(order.trade_price).toFixed(2) : '0.00',
     };
 }
 
@@ -157,12 +160,17 @@ async function sendTradeWhatsApp(client, order, statusLabel) {
     // Status text: 'Fully Traded' -> 'TRADED', 'Partially Traded' -> 'PARTIALLY TRADED'
     const statusText = statusLabel === 'Fully Traded' ? 'TRADED' : 'PARTIALLY TRADED';
 
-    // Approved 360dialog template: 'navia_trade_confirmation' (3 params:
-    // client name, exchange+side+symbol, status). Separate from the
-    // downtime-alert template 'azure_navia_test_u' (2 params: name, ucc)
-    // used in adminControl.js. Override via Azure App Setting if it ever
-    // needs to change without a code deploy.
-    const templateName = process.env.TRADE_CONFIRM_TEMPLATE_NAME || 'navia_trade_confirmation';
+    // Approved WhatsApp template: 'navia_trade_confirmation_01' (4 params)
+    // Template text:
+    //   "Your square-off {1} order for {2} for a quantity of {3} has been
+    //    successfully executed at Rs.{4}.
+    //    This is an automated confirmation from Navia Backup. Please contact
+    //    support desk for any queries. Team Navia."
+    // {1} = BUY / SELL
+    // {2} = Exchange + Scrip name with strike (e.g. "NSE NIFTY23JUN25550CE")
+    // {3} = executed quantity
+    // {4} = trade price (e.g. "299.90")
+    const templateName = process.env.TRADE_CONFIRM_TEMPLATE_NAME || 'navia_trade_confirmation_01';
 
     const mobileClean = client.mobile.toString().replace(/\D/g, '');
     const waNumber     = mobileClean.startsWith('91') ? mobileClean : `91${mobileClean}`;
@@ -177,9 +185,10 @@ async function sendTradeWhatsApp(client, order, statusLabel) {
             components: [{
                 type: 'body',
                 parameters: [
-                    { type: 'text', text: ctx.clientName || order.ucc },
-                    { type: 'text', text: `${ctx.exchange} ${ctx.side} ${ctx.tradingSymbol}` },
-                    { type: 'text', text: statusText },
+                    { type: 'text', text: ctx.side },                                       // {1} BUY/SELL
+                    { type: 'text', text: `${ctx.exchange} ${ctx.tradingSymbol}` },         // {2} exchange + scrip
+                    { type: 'text', text: String(ctx.executedQty) },                        // {3} quantity
+                    { type: 'text', text: ctx.tradePrice },                                 // {4} trade price
                 ]
             }]
         }

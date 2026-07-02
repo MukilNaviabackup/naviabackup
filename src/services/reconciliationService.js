@@ -45,7 +45,7 @@ async function reconcile() {
         const openOrders = await pool.request().query(`
             SELECT order_id, ucc, exchange, segment, symbol, isin,
                    side, quantity, executed_qty, remaining_qty,
-                   status, placed_at,
+                   status, placed_at, trade_price,
                    expiry_date, strike_price, option_type
             FROM squareoff_orders
             WHERE status IN ('FILE_GENERATED','PARTIALLY_TRADED')
