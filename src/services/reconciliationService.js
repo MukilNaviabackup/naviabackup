@@ -77,13 +77,19 @@ async function reconcileOrder(pool, order) {
     const isCM = order.segment === 'CM' || ['CM','NSECM','BSECM'].includes((order.segment||'').toUpperCase().trim());
 
     let executedQty = 0;
+    let tradePrice  = null;
 
     if (isFO) {
-        executedQty = await getFOExecutedQty(pool, order);
+        ({ executedQty, tradePrice } = await getFOExecutedQty(pool, order));
     } else if (isCM) {
-        executedQty = await getCMExecutedQty(pool, order);
+        ({ executedQty, tradePrice } = await getCMExecutedQty(pool, order));
     } else {
-        return; // MCX - skip for now
+        const isMCX = (order.exchange || '').toUpperCase() === 'MCX';
+        if (isMCX) {
+            ({ executedQty, tradePrice } = await getFOExecutedQty(pool, order));
+        } else {
+            return;
+        }
     }
 
     const requestedQty  = Number(order.quantity)     || 0;
@@ -113,13 +119,15 @@ async function reconcileOrder(pool, order) {
         .input('status',       sql.VarChar(30),   newStatus)
         .input('executedQty',  sql.Decimal(18,2), executedQty)
         .input('remainingQty', sql.Decimal(18,2), remainingQty)
+        .input('tradePrice',   sql.Decimal(18,2), tradePrice)
         .input('tradedAt',     sql.DateTime,      newStatus === STATUS.TRADED ? new Date() : null)
         .query(`
             UPDATE squareoff_orders
             SET status        = @status,
                 executed_qty  = @executedQty,
                 remaining_qty = @remainingQty,
-                traded_at     = CASE WHEN @tradedAt IS NOT NULL THEN @tradedAt ELSE traded_at END
+                trade_price   = CASE WHEN @tradePrice IS NOT NULL THEN @tradePrice ELSE trade_price END,
+                traded_at     = CASE WHEN @tradedAt   IS NOT NULL THEN @tradedAt   ELSE traded_at   END
             WHERE order_id = @orderId
         `);
 
@@ -143,7 +151,7 @@ async function reconcileOrder(pool, order) {
     // partial trade qty increases but status stays PARTIALLY_TRADED).
     if (newStatus !== order.status &&
         (newStatus === STATUS.TRADED || newStatus === STATUS.PARTIALLY_TRADED)) {
-        const orderForNotify = { ...order, status: newStatus, executed_qty: executedQty, remaining_qty: remainingQty, traded_at: new Date() };
+        const orderForNotify = { ...order, status: newStatus, executed_qty: executedQty, remaining_qty: remainingQty, traded_at: new Date(), trade_price: tradePrice };
         notifyTradeStatusChange(pool, sql, orderForNotify, newStatus)
             .catch(err => console.error('[Recon] Notification error (non-fatal):', err.message));
     }
@@ -153,7 +161,8 @@ async function reconcileOrder(pool, order) {
 // Match: UCC + symbol + exchange + segment + expiry + strike + option_type
 // Trade time must be AFTER order placed_at
 async function getFOExecutedQty(pool, order) {
-    const sideCol = (order.side || '').toUpperCase() === 'BUY' ? 'buy_qty' : 'sell_qty';
+    const sideCol   = (order.side || '').toUpperCase() === 'BUY' ? 'buy_qty'       : 'sell_qty';
+    const priceCol  = (order.side || '').toUpperCase() === 'BUY' ? 'avg_buy_price' : 'avg_sell_price';
 
     const result = await pool.request()
         .input('ucc',         sql.VarChar(20),   order.ucc)
@@ -164,7 +173,8 @@ async function getFOExecutedQty(pool, order) {
         .input('strike',      sql.Decimal(18,2), order.strike_price || null)
         .input('optionType',  sql.VarChar(5),    order.option_type || null)
         .query(`
-            SELECT SUM(${sideCol}) AS executed_qty
+            SELECT SUM(${sideCol}) AS executed_qty,
+                   SUM(${priceCol} * ${sideCol}) / NULLIF(SUM(${sideCol}),0) AS trade_price
             FROM day_positions
             WHERE ucc          = @ucc
             AND   symbol       = @symbol
@@ -185,7 +195,10 @@ async function getFOExecutedQty(pool, order) {
             )
         `);
 
-    return Number(result.recordset[0]?.executed_qty) || 0;
+    return {
+        executedQty: Number(result.recordset[0]?.executed_qty) || 0,
+        tradePrice:  Number(result.recordset[0]?.trade_price)  || null,
+    };
 }
 
 // ── CM Matching ───────────────────────────────────────────────────────────────
@@ -193,18 +206,19 @@ async function getFOExecutedQty(pool, order) {
 // Trade time must be AFTER order placed_at
 async function getCMExecutedQty(pool, order) {
     if (!order.isin) {
-        // Try matching by symbol directly if no ISIN stored yet
         return getCMExecutedQtyBySymbol(pool, order);
     }
 
-    const sideCol = (order.side || '').toUpperCase() === 'BUY' ? 'buy_qty' : 'sell_qty';
+    const sideCol  = (order.side || '').toUpperCase() === 'BUY' ? 'buy_qty'       : 'sell_qty';
+    const priceCol = (order.side || '').toUpperCase() === 'BUY' ? 'avg_buy_price' : 'avg_sell_price';
 
     const result = await pool.request()
         .input('ucc',      sql.VarChar(20),  order.ucc)
         .input('isin',     sql.VarChar(20),  order.isin)
         .input('placedAt', sql.DateTime,     new Date(order.placed_at))
         .query(`
-            SELECT SUM(dp.${sideCol}) AS executed_qty
+            SELECT SUM(dp.${sideCol}) AS executed_qty,
+                   SUM(dp.${priceCol} * dp.${sideCol}) / NULLIF(SUM(dp.${sideCol}),0) AS trade_price
             FROM day_positions dp
             JOIN symbol_master sm ON dp.symbol = sm.nse_symbol OR dp.symbol = sm.bse_symbol
             WHERE dp.ucc          = @ucc
@@ -214,22 +228,26 @@ async function getCMExecutedQty(pool, order) {
             AND   dp.segment      = 'CM'
         `);
 
-    return Number(result.recordset[0]?.executed_qty) || 0;
+    return {
+        executedQty: Number(result.recordset[0]?.executed_qty) || 0,
+        tradePrice:  Number(result.recordset[0]?.trade_price)  || null,
+    };
 }
 
 // CM matching by direct symbol (squareoff_orders.symbol = day_positions.symbol for CM)
 async function getCMExecutedQtyBySymbol(pool, order) {
-    const sideCol = (order.side || '').toUpperCase() === 'BUY' ? 'buy_qty' : 'sell_qty';
+    const sideCol  = (order.side || '').toUpperCase() === 'BUY' ? 'buy_qty'       : 'sell_qty';
+    const priceCol = (order.side || '').toUpperCase() === 'BUY' ? 'avg_buy_price' : 'avg_sell_price';
 
-    // PRIMARY: Direct symbol match — squareoff_orders.symbol matches day_positions.symbol
-    // e.g. both have 'WIPRO' for NSE CM trades
+    // PRIMARY: Direct symbol match
     const directResult = await pool.request()
-        .input('ucc',      sql.VarChar(20), order.ucc)
+        .input('ucc',      sql.VarChar(20),  order.ucc)
         .input('symbol',   sql.VarChar(100), order.symbol.trim())
         .input('exchange', sql.VarChar(10),  order.exchange)
         .input('placedAt', sql.DateTime,     new Date(order.placed_at))
         .query(`
-            SELECT SUM(dp.${sideCol}) AS executed_qty
+            SELECT SUM(dp.${sideCol}) AS executed_qty,
+                   SUM(dp.${priceCol} * dp.${sideCol}) / NULLIF(SUM(dp.${sideCol}),0) AS trade_price
             FROM day_positions dp
             WHERE dp.ucc          = @ucc
             AND   dp.symbol       = @symbol
@@ -239,11 +257,11 @@ async function getCMExecutedQtyBySymbol(pool, order) {
             AND   dp.trade_date   = CAST(GETDATE() AS DATE)
         `);
 
-    const directQty = Number(directResult.recordset[0]?.executed_qty) || 0;
-    if (directQty > 0) return directQty;
+    const directQty   = Number(directResult.recordset[0]?.executed_qty) || 0;
+    const directPrice = Number(directResult.recordset[0]?.trade_price)  || null;
+    if (directQty > 0) return { executedQty: directQty, tradePrice: directPrice };
 
-    // FALLBACK: symbol_master lookup using first word of symbol name
-    // (handles cases where squareoff_orders stores full name like 'WIPRO LTD')
+    // FALLBACK: symbol_master lookup
     const firstWord = order.symbol.trim().split(/\s+/)[0];
     const symResult = await pool.request()
         .input('symbol',   sql.VarChar(50),  firstWord)
@@ -255,11 +273,11 @@ async function getCMExecutedQtyBySymbol(pool, order) {
             AND is_active = 1
         `);
 
-    if (symResult.recordset.length === 0) return 0;
+    if (symResult.recordset.length === 0) return { executedQty: 0, tradePrice: null };
 
     const nseSymbol = symResult.recordset[0].nse_symbol || '';
     const bseSymbol = symResult.recordset[0].bse_symbol || '';
-    if (!nseSymbol && !bseSymbol) return 0;
+    if (!nseSymbol && !bseSymbol) return { executedQty: 0, tradePrice: null };
 
     const fallbackResult = await pool.request()
         .input('ucc',       sql.VarChar(20), order.ucc)
@@ -267,7 +285,8 @@ async function getCMExecutedQtyBySymbol(pool, order) {
         .input('bseSymbol', sql.VarChar(50), bseSymbol)
         .input('placedAt',  sql.DateTime,    new Date(order.placed_at))
         .query(`
-            SELECT SUM(dp.${sideCol}) AS executed_qty
+            SELECT SUM(dp.${sideCol}) AS executed_qty,
+                   SUM(dp.${priceCol} * dp.${sideCol}) / NULLIF(SUM(dp.${sideCol}),0) AS trade_price
             FROM day_positions dp
             WHERE dp.ucc      = @ucc
             AND  (dp.symbol   = @nseSymbol OR dp.symbol = @bseSymbol)
@@ -276,7 +295,10 @@ async function getCMExecutedQtyBySymbol(pool, order) {
             AND   dp.trade_date   = CAST(GETDATE() AS DATE)
         `);
 
-    return Number(fallbackResult.recordset[0]?.executed_qty) || 0;
+    return {
+        executedQty: Number(fallbackResult.recordset[0]?.executed_qty) || 0,
+        tradePrice:  Number(fallbackResult.recordset[0]?.trade_price)  || null,
+    };
 }
 
 // ── Start service ─────────────────────────────────────────────────────────────
