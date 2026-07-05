@@ -155,6 +155,7 @@ router.post('/upload', adminAuthenticate, upload.single('client_file'), async (r
                         .input('pincode',    sql.VarChar(10),  row['pincode']?.trim() || null)
                         .input('city',       sql.VarChar(100), row['city']?.trim() || null)
                         .input('state',      sql.VarChar(100), row['state']?.trim() || null)
+                        .input('terminal',   sql.VarChar(10),  row['terminal']?.trim().toUpperCase() || null)
                         .input('modifiedBy', sql.VarChar(50),  req.admin.username || 'admin')
                         .query(`
                             UPDATE clients SET
@@ -167,6 +168,7 @@ router.post('/upload', adminAuthenticate, upload.single('client_file'), async (r
                                 mcx_fo = @mcxFo,
                                 address = @address, pincode = @pincode,
                                 city = @city, state = @state,
+                                terminal = @terminal,
                                 modified_at = GETDATE(), modified_by = @modifiedBy
                             WHERE ucc = @ucc
                         `);
@@ -193,20 +195,21 @@ router.post('/upload', adminAuthenticate, upload.single('client_file'), async (r
                         .input('pincode',    sql.VarChar(10),  row['pincode']?.trim() || null)
                         .input('city',       sql.VarChar(100), row['city']?.trim() || null)
                         .input('state',      sql.VarChar(100), row['state']?.trim() || null)
+                        .input('terminal',   sql.VarChar(10),  row['terminal']?.trim().toUpperCase() || null)
                         .query(`
                             INSERT INTO clients (
                                 ucc, dob, mobile, email, client_name,
                                 pan, dp_id, bo_id, account_status,
                                 nse_cm, nse_fo, nse_cd,
                                 bse_cm, bse_fo, bse_cd, mcx_fo,
-                                address, pincode, city, state,
+                                address, pincode, city, state, terminal,
                                 is_active, last_synced_at
                             ) VALUES (
                                 @ucc, @dob, @mobile, @email, @clientName,
                                 @pan, @dpId, @boId, @accStatus,
                                 @nseCm, @nseFo, @nseCd,
                                 @bseCm, @bseFo, @bseCd, @mcxFo,
-                                @address, @pincode, @city, @state,
+                                @address, @pincode, @city, @state, @terminal,
                                 1, GETDATE()
                             )
                         `);
@@ -300,7 +303,7 @@ router.post('/create', async (req, res) => {
         pan, dp_id, bo_id, account_status,
         nse_cm, nse_fo, nse_cd,
         bse_cm, bse_fo, bse_cd, mcx_fo,
-        address, pincode, city, state
+        address, pincode, city, state, terminal
     } = req.body;
 
     // Required field validation
@@ -347,13 +350,14 @@ router.post('/create', async (req, res) => {
             .input('pincode',      sql.VarChar(10),  pincode?.toString().trim() || null)
             .input('city',         sql.VarChar(100), city?.toString().trim() || null)
             .input('state',        sql.VarChar(100), state?.toString().trim() || null)
+            .input('terminal',     sql.VarChar(10),  terminal?.toString().trim().toUpperCase() || null)
             .query(`
                 INSERT INTO clients (
                     ucc, dob, mobile, email, client_name,
                     pan, dp_id, bo_id, account_status,
                     nse_cm, nse_fo, nse_cd,
                     bse_cm, bse_fo, bse_cd, mcx_fo,
-                    address, pincode, city, state,
+                    address, pincode, city, state, terminal,
                     is_active, last_synced_at
                 )
                 OUTPUT INSERTED.client_id
@@ -362,7 +366,7 @@ router.post('/create', async (req, res) => {
                     @pan, @dpId, @boId, @accStatus,
                     @nseCm, @nseFo, @nseCd,
                     @bseCm, @bseFo, @bseCd, @mcxFo,
-                    @address, @pincode, @city, @state,
+                    @address, @pincode, @city, @state, @terminal,
                     1, GETDATE()
                 )
             `);
@@ -399,7 +403,7 @@ router.put('/update/:ucc', async (req, res) => {
         pan, dp_id, bo_id, account_status, is_active,
         nse_cm, nse_fo, nse_cd,
         bse_cm, bse_fo, bse_cd, mcx_fo,
-        address, pincode, city, state
+        address, pincode, city, state, terminal
     } = req.body;
 
     try {
@@ -440,6 +444,7 @@ router.put('/update/:ucc', async (req, res) => {
         if (pincode      !== undefined) { updates.push('pincode = @pincode');           request.input('pincode',    sql.VarChar(10),  pincode?.toString().trim() || null); }
         if (city         !== undefined) { updates.push('city = @city');                 request.input('city',       sql.VarChar(100), city?.toString().trim() || null); }
         if (state        !== undefined) { updates.push('state = @state');               request.input('state',      sql.VarChar(100), state?.toString().trim() || null); }
+        if (terminal     !== undefined) { updates.push('terminal = @terminal');         request.input('terminal',   sql.VarChar(10),  terminal ? terminal.toString().trim().toUpperCase() : null); }
 
         if (updates.length === 0) {
             return res.status(400).json({ error: 'No fields provided to update.' });
@@ -485,7 +490,7 @@ router.post('/upsert', async (req, res) => {
         pan, dp_id, bo_id, account_status, is_active,
         nse_cm, nse_fo, nse_cd,
         bse_cm, bse_fo, bse_cd, mcx_fo,
-        address, pincode, city, state
+        address, pincode, city, state, terminal
     } = req.body;
 
     if (!ucc || !dob || !mobile || !email || !client_name) {
@@ -527,6 +532,7 @@ router.post('/upsert', async (req, res) => {
             .input('pincode',    sql.VarChar(10),  pincode?.toString().trim() || null)
             .input('city',       sql.VarChar(100), city?.toString().trim() || null)
             .input('state',      sql.VarChar(100), state?.toString().trim() || null)
+            .input('terminal',   sql.VarChar(10),  terminal?.toString().trim().toUpperCase() || null)
             .query(`
                 MERGE clients AS target
                 USING (SELECT @ucc AS ucc) AS source ON target.ucc = source.ucc
@@ -541,6 +547,7 @@ router.post('/upsert', async (req, res) => {
                         mcx_fo = @mcxFo,
                         address = @address, pincode = @pincode,
                         city = @city, state = @state,
+                        terminal = @terminal,
                         last_synced_at = GETDATE(),
                         modified_at = GETDATE(),
                         modified_by = 'BMS_SYNC'
@@ -550,14 +557,14 @@ router.post('/upsert', async (req, res) => {
                         pan, dp_id, bo_id, account_status, is_active,
                         nse_cm, nse_fo, nse_cd,
                         bse_cm, bse_fo, bse_cd, mcx_fo,
-                        address, pincode, city, state,
+                        address, pincode, city, state, terminal,
                         last_synced_at
                     ) VALUES (
                         @ucc, @dob, @mobile, @email, @clientName,
                         @pan, @dpId, @boId, @accStatus, @isActive,
                         @nseCm, @nseFo, @nseCd,
                         @bseCm, @bseFo, @bseCd, @mcxFo,
-                        @address, @pincode, @city, @state,
+                        @address, @pincode, @city, @state, @terminal,
                         GETDATE()
                     );
             `);
