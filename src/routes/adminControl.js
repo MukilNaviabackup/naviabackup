@@ -77,9 +77,11 @@ router.get('/segments', adminAuthenticate, async (req, res) => {
 
 // ── POST /api/admin/control/segments/toggle ───────────────────────────────────
 router.post('/segments/toggle', adminAuthenticate, requireFullAdmin, async (req, res) => {
-    const { exchange, segment, enable, notes } = req.body;
+    const { exchange, segment, enable, notes, terminal } = req.body;
     if (!exchange || !segment)
         return res.status(400).json({ error: 'Exchange and segment are required.' });
+    if (enable && !terminal)
+        return res.status(400).json({ error: 'Please select a terminal (INHOUSE or BOW) before enabling a segment.', code: 'TERMINAL_REQUIRED' });
     try {
         const pool = await getConnection();
         await pool.request()
@@ -88,13 +90,15 @@ router.post('/segments/toggle', adminAuthenticate, requireFullAdmin, async (req,
             .input('enable',   sql.Bit,     enable ? 1 : 0)
             .input('adminId',  sql.Int,     req.admin.adminId)
             .input('notes',    sql.VarChar, notes || '')
+            .input('terminal', sql.VarChar(10), terminal ? terminal.toUpperCase() : null)
             .query(`UPDATE segment_controls SET
                     is_enabled  = @enable,
                     enabled_by  = CASE WHEN @enable = 1 THEN @adminId ELSE enabled_by  END,
                     enabled_at  = CASE WHEN @enable = 1 THEN GETDATE() ELSE enabled_at  END,
                     disabled_by = CASE WHEN @enable = 0 THEN @adminId ELSE disabled_by END,
                     disabled_at = CASE WHEN @enable = 0 THEN GETDATE() ELSE disabled_at END,
-                    notes       = @notes
+                    notes       = @notes,
+                    terminal    = CASE WHEN @terminal IS NOT NULL THEN @terminal WHEN @enable = 0 THEN NULL ELSE terminal END
                     WHERE exchange = @exchange AND segment = @segment`);
         await pool.request()
             .input('adminId', sql.Int,     req.admin.adminId)
@@ -151,12 +155,21 @@ router.post('/communicate', adminAuthenticate, requireFullAdmin, async (req, res
         if (!segColumn)
             return res.status(400).json({ error: `Unknown segment: ${exchange} ${segment}` });
 
+        // Fetch this segment's assigned terminal, then filter clients by it
+        const scRes = await pool.request()
+            .input('exchange', sql.VarChar(10), exchange.toUpperCase())
+            .input('segment',  sql.VarChar(10), segment.toUpperCase())
+            .query(`SELECT terminal FROM segment_controls WHERE exchange = @exchange AND segment = @segment`);
+        const segTerminal = scRes.recordset[0]?.terminal || null;
+
         const clientResult = await pool.request()
+            .input('segTerminal', sql.VarChar(10), segTerminal)
             .query(`SELECT ucc, client_name, mobile, email
                     FROM clients
                     WHERE ${segColumn} = 1
                     AND is_active = 1
-                    AND account_status = 'ACTIVE'`);
+                    AND account_status = 'ACTIVE'
+                    AND (@segTerminal IS NULL OR terminal = @segTerminal)`);
         const clients = clientResult.recordset;
 
         if (clients.length === 0)
