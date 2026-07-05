@@ -339,10 +339,33 @@ async function sendBatchEmail(orders) {
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
+// Debounce state — collects orders placed within a short burst (e.g. Square Off
+// All firing N calls within milliseconds) into a single batched email.
+const DEBOUNCE_MS       = 2000;
+const MAX_BATCH_WAIT_MS = 5000; // safety cap so a steady trickle of orders can't starve the flush forever
+let pendingOrders  = [];
+let debounceTimer  = null;
+let firstQueuedAt  = null;
+
+function flushPendingOrders() {
+    const batch = pendingOrders;
+    pendingOrders  = [];
+    debounceTimer  = null;
+    firstQueuedAt  = null;
+    if (!batch.length) return;
+    sendBatchEmail(batch).catch(e =>
+        console.error('[RMSEmail] Send error:', e.message)
+    );
+}
+
 /**
  * queueRMSEmailAlert(orderDetails)
  *
- * Sends an email immediately when an order is placed.
+ * Queues an order and debounces for DEBOUNCE_MS of inactivity before sending
+ * ONE batched email with all queued orders (and their basket file attachments).
+ * A burst of orders (Square Off All) resets the timer on each call, so the
+ * email fires shortly after the last order in the burst — capped at
+ * MAX_BATCH_WAIT_MS from the first order so it can never wait indefinitely.
  * Always non-blocking (fire and forget).
  */
 function queueRMSEmailAlert(orderDetails) {
@@ -357,10 +380,20 @@ function queueRMSEmailAlert(orderDetails) {
         strike_price: orderDetails.strike_price || null,
         option_type:  orderDetails.option_type  || null,
     };
-    console.log(`[RMSEmail] Sending alert: ${order.symbol} ${order.exchange}/${order.segment} UCC:${order.ucc}`);
-    sendBatchEmail([order]).catch(e =>
-        console.error('[RMSEmail] Send error:', e.message)
-    );
+    console.log(`[RMSEmail] Queued: ${order.symbol} ${order.exchange}/${order.segment} UCC:${order.ucc}`);
+
+    pendingOrders.push(order);
+    if (!firstQueuedAt) firstQueuedAt = Date.now();
+
+    if (debounceTimer) clearTimeout(debounceTimer);
+
+    const elapsed = Date.now() - firstQueuedAt;
+    if (elapsed >= MAX_BATCH_WAIT_MS) {
+        flushPendingOrders();
+        return;
+    }
+
+    debounceTimer = setTimeout(flushPendingOrders, DEBOUNCE_MS);
 }
 
 module.exports = { queueRMSEmailAlert };
