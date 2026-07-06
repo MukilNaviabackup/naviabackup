@@ -165,38 +165,44 @@ function buildNEATFORow(order, qty) {
     return fields.join(',');
 }
 
-// ── Build BOLT CM row (for Excel) ─────────────────────────────────────────────
+// ── BOLT CSV header — confirmed byte-for-byte against real BOLT-accepted
+// sample files (BasketCM/BasketFO 02Jul2026, CRLF line endings)
+const BOLT_HEADER = 'Buy/Sell,Qty,Rev.Qty,Scrip Code,Rate,Short/Client ID,Retention Status,Client Type,Order Type,CP Code,TrgRate';
+
+// ── Build BOLT CM row (CSV line) ──────────────────────────────────────────────
+// scrip_code is guaranteed present here — the caller blocks the whole batch
+// before reaching this function if any order couldn't resolve one.
 function buildBOLTCMRow(order, qty) {
-    return {
-        'Buy/Sell':          order.side === 'BUY' ? 'B' : 'S',
-        'Qty':               qty,
-        'Rev.Qty':           qty,
-        'Scrip Code':        order.scrip_code || order.symbol,
-        'Rate':              '',
-        'Short/Client ID':   order.ucc,
-        'Retention Status':  'EOSESS',
-        'Client Type':       'CLIENT',
-        'Order Type':        'G',
-        'CP Code':           '',
-        'TrgRate':           ''
-    };
+    return [
+        order.side === 'BUY' ? 'B' : 'S',
+        qty,
+        qty,
+        order.scrip_code || '',
+        '',
+        order.ucc,
+        'EOSESS',
+        'CLIENT',
+        'G',
+        '',
+        ''
+    ].join(',');
 }
 
-// ── Build BOLT FO row (for Excel) ─────────────────────────────────────────────
+// ── Build BOLT FO row (CSV line) ──────────────────────────────────────────────
 function buildBOLTFORow(order, qty) {
-    return {
-        'Buy/Sell':          order.side === 'BUY' ? 'B' : 'S',
-        'Qty':               qty,
-        'Rev.Qty':           qty,
-        'Scrip Code':        order.scrip_code || order.symbol,
-        'Rate':              '',
-        'Short/Client ID':   order.ucc,
-        'Retention Status':  'EOSESS',
-        'Client Type':       'CLIENT',
-        'Order Type':        'G',
-        'CP Code':           '',
-        'TrgRate':           ''
-    };
+    return [
+        order.side === 'BUY' ? 'B' : 'S',
+        qty,
+        qty,
+        order.scrip_code || '',
+        '',
+        order.ucc,
+        'EOSESS',
+        'CLIENT',
+        'G',
+        '',
+        ''
+    ].join(',');
 }
 
 // ── POST /api/admin/orders/download ──────────────────────────────────────────
@@ -332,34 +338,18 @@ router.post('/download', adminAuthenticate, async (req, res) => {
                     : 'No BSE scrip code found in day_positions or symbol_master.'
             })));
         } else if (bseCM.length > 0) {
-            const workbook  = new ExcelJS.Workbook();
-            const worksheet = workbook.addWorksheet('Orders');
-            worksheet.columns = [
-                { header: 'Buy/Sell',         key: 'Buy/Sell',         width: 10 },
-                { header: 'Qty',              key: 'Qty',              width: 8  },
-                { header: 'Rev.Qty',          key: 'Rev.Qty',          width: 8  },
-                { header: 'Scrip Code',       key: 'Scrip Code',       width: 12 },
-                { header: 'Rate',             key: 'Rate',             width: 8  },
-                { header: 'Short/Client ID',  key: 'Short/Client ID',  width: 14 },
-                { header: 'Retention Status', key: 'Retention Status', width: 16 },
-                { header: 'Client Type',      key: 'Client Type',      width: 12 },
-                { header: 'Order Type',       key: 'Order Type',       width: 10 },
-                { header: 'CP Code',          key: 'CP Code',          width: 10 },
-                { header: 'TrgRate',          key: 'TrgRate',          width: 8  },
-            ];
-
+            const lines = [];
             for (const order of bseCM) {
                 const slices = splitIntoSlices(order.quantity, null);
                 for (const qty of slices) {
-                    worksheet.addRow(buildBOLTCMRow(order, qty));
+                    lines.push(buildBOLTCMRow(order, qty));
                 }
             }
 
-            const buffer = await workbook.xlsx.writeBuffer();
             files.push({
-                filename:    `BasketCM${fileDate}-${fileTime}.xlsx`,
-                content:     buffer,
-                contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                filename:    `BasketCM${fileDate}-${fileTime}.csv`,
+                content:     [BOLT_HEADER, ...lines].join('\r\n') + '\r\n',
+                contentType: 'text/csv',
                 exchange:    'BSE',
                 segment:     'CM',
                 orderIds:    bseCM.map(o => o.order_id)
@@ -378,36 +368,20 @@ router.post('/download', adminAuthenticate, async (req, res) => {
                     : 'No BSE scrip code found in day_positions or symbol_master.'
             })));
         } else if (bseFO.length > 0) {
-            const workbook  = new ExcelJS.Workbook();
-            const worksheet = workbook.addWorksheet('Orders');
-            worksheet.columns = [
-                { header: 'Buy/Sell',         key: 'Buy/Sell',         width: 10 },
-                { header: 'Qty',              key: 'Qty',              width: 8  },
-                { header: 'Rev.Qty',          key: 'Rev.Qty',          width: 8  },
-                { header: 'Scrip Code',       key: 'Scrip Code',       width: 12 },
-                { header: 'Rate',             key: 'Rate',             width: 8  },
-                { header: 'Short/Client ID',  key: 'Short/Client ID',  width: 14 },
-                { header: 'Retention Status', key: 'Retention Status', width: 16 },
-                { header: 'Client Type',      key: 'Client Type',      width: 12 },
-                { header: 'Order Type',       key: 'Order Type',       width: 10 },
-                { header: 'CP Code',          key: 'CP Code',          width: 10 },
-                { header: 'TrgRate',          key: 'TrgRate',          width: 8  },
-            ];
-
+            const lines = [];
             for (const order of bseFO) {
                 const baseSymbol = extractBaseSymbol(order.symbol);
                 const sliceQty   = sliceMap[baseSymbol.toUpperCase()] || null;
                 const slices     = splitIntoSlices(order.quantity, sliceQty);
                 for (const qty of slices) {
-                    worksheet.addRow(buildBOLTFORow(order, qty));
+                    lines.push(buildBOLTFORow(order, qty));
                 }
             }
 
-            const buffer = await workbook.xlsx.writeBuffer();
             files.push({
-                filename:    `BasketFO${fileDate}-${fileTime}.xlsx`,
-                content:     buffer,
-                contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                filename:    `BasketFO${fileDate}-${fileTime}.csv`,
+                content:     [BOLT_HEADER, ...lines].join('\r\n') + '\r\n',
+                contentType: 'text/csv',
                 exchange:    'BSE',
                 segment:     'FO',
                 orderIds:    bseFO.map(o => o.order_id)
