@@ -57,6 +57,31 @@ function getLotSize(symbol, lotSizeMap) {
     return (lotSizeMap && lotSizeMap[base]) || 1;
 }
 
+// ── Freeze-quantity (slice) lookup + splitter ─────────────────────────────
+// Same base-symbol extraction convention as getLotSize() above, applied to
+// slice_qty_master instead. Used by the BSE BOLT generator to replicate the
+// freeze-quantity splitting SqOffOrders.jsx already does client-side for
+// NSE FO (see its splitSlices/sliceQty). Returns null (no split) when the
+// symbol has no configured slice_qty row — safe by construction: an order
+// is never split unless real freeze-qty data exists for that symbol.
+function getSliceQty(symbol, sliceQtyMap) {
+    if (!symbol) return null;
+    const base = symbol.toUpperCase().trim().split(/[\s@0-9]/)[0];
+    return (sliceQtyMap && sliceQtyMap[base]) || null;
+}
+
+function splitQtyBySlice(qty, sliceQ) {
+    if (!sliceQ || qty <= sliceQ) return [qty];
+    const chunks = [];
+    let rem = qty;
+    while (rem > 0) {
+        const c = Math.min(rem, sliceQ);
+        chunks.push(c);
+        rem -= c;
+    }
+    return chunks;
+}
+
 // NSE NEAT FO Basket — options and futures
 function makeNeatFORow(serial, side, symbol, expiry, strikePrice, optionType, qty, ucc, memberCode, lotSize) {
     // Col 3: 1=BUY, 2=SELL
@@ -414,64 +439,183 @@ router.post('/orders/generate-file', adminAuthenticate, async (req, res) => {
                 });
             }
         } else if (exchange === 'BSE') {
-            // BSE BOLT format is XLSX (Excel), not CSV
+            // BSE BOLT format is plain CSV — confirmed against real BOLT-accepted
+            // sample files (BasketCM/BasketFO, CRLF line endings, no header
+            // missing, no XLSX). Replaces the old XLSX attempt entirely: that
+            // path (via the 'xlsx' package) was throwing and silently falling
+            // back to a headerless CSV with blank scrip codes and no filename
+            // — this was the actual cause of both the malformed email
+            // attachment and the "not valid JSON" download error.
+            //
+            // Scrip code was also never resolvable before: o.bse_scrip_code is
+            // never written when the order is created (see orders.js), and
+            // o.bse_code isn't a real column. Resolving it here the same way
+            // as orderDownload.js: day_positions (per-contract, live from
+            // DropCopy — correct for F&O) first, symbol_master (equity-level)
+            // as fallback for CM.
             const cmOrders = orders.filter(o => o.segment === 'CM');
             const foOrders = orders.filter(o => o.segment === 'FO');
+            const bseOrders = [...cmOrders, ...foOrders];
 
-            // BOLT headers (11 columns)
-            const boltHeaders = ['Buy/Sell','Qty','Rev.Qty','Scrip Code','Rate',
-                                  'Short/Client ID','Retention Status','Client Type',
-                                  'Order Type','CP Code','TrgRate'];
+            const scripMap = {}; // order_id -> resolved scrip code
+            if (bseOrders.length > 0) {
+                const scripResult = await pool.request().query(`
+                    SELECT so.order_id,
+                           dp.bse_scrip_code AS dp_scrip_code,
+                           sm.bse_scrip_code AS sm_scrip_code
+                    FROM squareoff_orders so
+                    LEFT JOIN day_positions dp
+                        ON dp.ucc      = so.ucc
+                        AND dp.symbol   = so.symbol
+                        AND dp.exchange = so.exchange
+                        AND dp.segment  = so.segment
+                        AND (dp.expiry_date = so.expiry_date OR (dp.expiry_date IS NULL AND so.expiry_date IS NULL))
+                        AND (ABS(ISNULL(dp.strike_price,0) - ISNULL(so.strike_price,0)) < 0.01)
+                        AND (dp.option_type = so.option_type OR (dp.option_type IS NULL AND so.option_type IS NULL))
+                    LEFT JOIN symbol_master sm
+                        ON (UPPER(sm.bse_symbol) = so.symbol OR UPPER(sm.nse_symbol) = so.symbol)
+                        AND sm.is_active = 1
+                    WHERE so.order_id IN (${idList})
+                `);
+                scripResult.recordset.forEach(r => {
+                    scripMap[r.order_id] = r.dp_scrip_code || r.sm_scrip_code || null;
+                });
+            }
 
-            // Build rows for CM + FO combined
-            const boltRows = [boltHeaders];
-            cmOrders.forEach(o => {
-                const side    = o.side.toUpperCase() === 'BUY' ? 'B' : 'S';
-                const scrip   = o.bse_scrip_code || o.bse_code || '';
-                if (!scrip) {
-                    console.warn(`[BSE BOLT] No scrip code for order ${o.order_id} ${o.symbol}`);
-                }
-                boltRows.push([side, o.quantity, o.quantity, scrip, '',
-                               o.ucc, 'EOSESS', 'CLIENT', 'G', '', '']);
-            });
-            foOrders.forEach(o => {
-                const side  = o.side.toUpperCase() === 'BUY' ? 'B' : 'S';
-                const scrip = o.bse_scrip_code || o.bse_code || '';
-                if (!scrip) {
-                    console.warn(`[BSE BOLT] No scrip code for FO order ${o.order_id} ${o.symbol}`);
-                }
-                boltRows.push([side, o.quantity, o.quantity, scrip, '',
-                               o.ucc, 'EOSESS', 'CLIENT', 'G', '', '']);
-            });
+            // Lot sizes for BSE F&O (index options: SENSEX/BANKEX) — same live
+            // lot_size_master table NSE already uses, filtered to BSE.
+            // squareoff_orders.quantity for the FO segment is stored as
+            // NUMBER OF LOTS (proven against real NSE NEAT bulk data — see
+            // SqOffOrders.jsx buildFORow Col 17: lot_size x qty). Since
+            // orders.js inserts BSE and NSE orders through the exact same
+            // code path with no exchange-specific handling, the same
+            // convention applies to BSE. Confirmed against the 06Jul2026 BSE
+            // OPTION LONG/SHORT sample files: all 181 real accepted rows
+            // (117 LONG + 64 SHORT) are exact multiples of the underlying
+            // lot size with zero exceptions — GCD of every quantity in both
+            // files is 20. BSE CM (equity) needs no such multiplication,
+            // matching NSE CM and confirmed by the CM sample files having
+            // arbitrary (non-lot-multiple) share counts.
+            const bseLotResult = await pool.request()
+                .input('exchange', sql.VarChar(10), 'BSE')
+                .query(`SELECT symbol, lot_size FROM lot_size_master WHERE exchange = @exchange AND lot_size > 1`);
+            const bseLotSizeMap = {};
+            bseLotResult.recordset.forEach(r => { bseLotSizeMap[r.symbol.toUpperCase()] = r.lot_size; });
 
-            // Generate XLSX file
+            // Freeze-quantity (slice) splitting for BSE F&O — same
+            // slice_qty_master table and splitting behavior already proven
+            // for NSE FO. Non-fatal: if slice_qty_master has no row for a
+            // symbol (no real freeze-qty data entered for SENSEX/BANKEX
+            // yet), every order for that symbol is sent as a single unsplit
+            // row exactly as before — this can only change behavior once
+            // real freeze-qty data exists, never break anything today.
+            let bseSliceQtyMap = {};
             try {
-                const XLSX = require('xlsx');
-                const ws   = XLSX.utils.aoa_to_sheet(boltRows);
-                const wb   = XLSX.utils.book_new();
-                XLSX.utils.book_append_sheet(wb, ws, 'BOLT');
-                const xlsxBuffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
-                filename = basketFilename('BasketBSE').replace('.csv', '.xlsx');
+                const sliceResult = await pool.request()
+                    .input('exchange', sql.VarChar(10), 'BSE')
+                    .query(`SELECT symbol, slice_qty FROM slice_qty_master WHERE exchange = @exchange`);
+                sliceResult.recordset.forEach(r => { bseSliceQtyMap[r.symbol.toUpperCase()] = r.slice_qty; });
+            } catch (sliceErr) {
+                console.error('[BSE BOLT] slice_qty_master lookup failed (non-fatal, no splitting applied):', sliceErr.message);
+            }
 
-                // Mark orders as file generated (before sending)
+            const BOLT_HEADER = 'Buy/Sell,Qty,Rev.Qty,Scrip Code,Rate,Short/Client ID,Retention Status,Client Type,Order Type,CP Code,TrgRate';
+            const buildBoltLine = (o, totalQty) => [
+                o.side.toUpperCase() === 'BUY' ? 'B' : 'S',
+                totalQty, totalQty,
+                scripMap[o.order_id] || '',
+                '', o.ucc, 'EOSESS', 'CLIENT', 'G', '', ''
+            ].join(',');
+
+            // Block a segment's whole file if ANY order in it can't resolve a
+            // scrip code — never ship a row with a blank code, and never let
+            // a resolved sibling silently vanish with no explanation either.
+            const bseFiles = [];
+            const bseBlocked = [];
+            for (const [label, group] of [['CM', cmOrders], ['FO', foOrders]]) {
+                if (group.length === 0) continue;
+                const unresolved = group.filter(o => !scripMap[o.order_id]);
+                if (unresolved.length > 0) {
+                    bseBlocked.push(...group.map(o => ({
+                        order_id: o.order_id, ucc: o.ucc, symbol: o.symbol, segment: label,
+                        reason: scripMap[o.order_id]
+                            ? `Blocked because another order in the same BSE ${label} batch has no resolvable scrip code.`
+                            : 'No BSE scrip code found in day_positions or symbol_master.'
+                    })));
+                    continue;
+                }
+                const lines = [];
+                group.forEach(o => {
+                    if (label === 'CM') {
+                        // Equity — plain share quantity, no lot multiplication, no slicing.
+                        lines.push(buildBoltLine(o, o.quantity));
+                    } else {
+                        // F&O (SENSEX/BANKEX) — o.quantity is lots; multiply by the live
+                        // BSE lot size, and split into multiple rows if a freeze-qty
+                        // (slice_qty_master) limit is configured for this symbol.
+                        const lot    = getLotSize(o.symbol, bseLotSizeMap);
+                        const sliceQ = getSliceQty(o.symbol, bseSliceQtyMap);
+                        splitQtyBySlice(o.quantity, sliceQ).forEach(chunkLots => {
+                            lines.push(buildBoltLine(o, chunkLots * lot));
+                        });
+                    }
+                });
+                bseFiles.push({
+                    filename: basketFilename(`Basket${label}`),
+                    content:  [BOLT_HEADER, ...lines].join('\r\n') + '\r\n',
+                    contentType: 'text/csv',
+                    orderIds: group.map(o => o.order_id)
+                });
+            }
+
+            const bseGeneratedIds = bseFiles.flatMap(f => f.orderIds);
+            if (bseGeneratedIds.length > 0) {
+                const bseGenIdList = bseGeneratedIds.map(id => `'${id}'`).join(',');
                 await pool.request().query(`
                     UPDATE squareoff_orders
                     SET file_generated = 1, file_generated_at = GETDATE(), status = 'FILE_GENERATED'
-                    WHERE order_id IN (${idList}) AND status = 'ORDER_RECEIVED'`);
+                    WHERE order_id IN (${bseGenIdList}) AND status = 'ORDER_RECEIVED'`);
+            }
 
-                res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-                res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-                return res.send(xlsxBuffer);
-            } catch (xlsxErr) {
-                console.error('[BSE BOLT] XLSX generation error:', xlsxErr.message);
-                // Fallback: send as CSV if xlsx fails
-                cmOrders.concat(foOrders).forEach(o => {
-                    const side  = o.side.toUpperCase() === 'BUY' ? 'B' : 'S';
-                    const scrip = o.bse_scrip_code || o.bse_code || '';
-                    csvRows.push([side, o.quantity, o.quantity, scrip, '',
-                                  o.ucc, 'EOSESS', 'CLIENT', 'G', '', ''].join(','));
+            // Email whichever files actually generated, with header included —
+            // and mention any blocked orders so RMS/admin knows to check them.
+            if (bseFiles.length > 0 || bseBlocked.length > 0) {
+                try {
+                    const transporter = createTransporter();
+                    await transporter.sendMail({
+                        from: `"Navia RMS" <${process.env.SMTP_FROM || 'updates@navia.co.in'}>`,
+                        to: process.env.ADMIN_ALERT_EMAIL || 'support@navia.co.in',
+                        subject: `[NAVIA BACKUP] Sq-Off File Generated — BSE — ${bseGeneratedIds.length} Orders`,
+                        html: `<div style="font-family:Arial,sans-serif">
+                            <h3>Navia Backup — Sq-Off Basket File</h3>
+                            <p>Exchange: <strong>BSE</strong> | Orders: <strong>${bseGeneratedIds.length}</strong> | Generated: ${new Date().toLocaleString('en-IN')}</p>
+                            ${bseFiles.map(f => `<p>File attached: <code>${f.filename}</code></p>`).join('')}
+                            ${bseBlocked.length > 0 ? `<p style="color:#dc2626">${bseBlocked.length} order(s) blocked — no resolvable BSE scrip code: ${bseBlocked.map(b => b.symbol).join(', ')}</p>` : ''}
+                            <p style="color:#dc2626;font-size:12px">Upload this file directly to the BSE terminal. Do not modify.</p>
+                        </div>`,
+                        attachments: bseFiles.map(f => ({ filename: f.filename, content: f.content, contentType: f.contentType }))
+                    });
+                } catch (emailErr) {
+                    console.error('Admin alert email error:', emailErr.message);
+                }
+            }
+
+            if (bseFiles.length === 0) {
+                return res.status(422).json({
+                    error: 'Could not resolve BSE scrip code for the selected order(s). No file generated.',
+                    blocked: bseBlocked
                 });
             }
+
+            return res.json({
+                success: true,
+                files: bseFiles.map(f => ({
+                    filename: f.filename,
+                    contentType: f.contentType,
+                    content: Buffer.from(f.content).toString('base64')
+                })),
+                ...(bseBlocked.length > 0 ? { blocked: bseBlocked } : {})
+            });
         } else if (exchange === 'MCX') {
             filename = basketFilename('BasketMCX');
             orders.forEach((o, i) => {
