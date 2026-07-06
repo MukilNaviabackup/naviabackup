@@ -216,11 +216,24 @@ router.post('/download', adminAuthenticate, async (req, res) => {
         order_ids.forEach((id, i) => request.input(`id${i}`, sql.UniqueIdentifier, id));
 
         const ordersResult = await request.query(`
-            SELECT order_id, ucc, exchange, segment, symbol, quantity,
-                   order_type, side, placed_at, expiry_date, strike_price, option_type
-            FROM squareoff_orders
-            WHERE order_id IN (${idList})
-            ORDER BY exchange, segment, placed_at
+            SELECT so.order_id, so.ucc, so.exchange, so.segment, so.symbol, so.quantity,
+                   so.order_type, so.side, so.placed_at, so.expiry_date, so.strike_price, so.option_type,
+                   dp.bse_scrip_code AS dp_scrip_code,
+                   sm.bse_scrip_code AS sm_scrip_code
+            FROM squareoff_orders so
+            LEFT JOIN day_positions dp
+                ON dp.ucc      = so.ucc
+                AND dp.symbol   = so.symbol
+                AND dp.exchange = so.exchange
+                AND dp.segment  = so.segment
+                AND (dp.expiry_date = so.expiry_date OR (dp.expiry_date IS NULL AND so.expiry_date IS NULL))
+                AND (ABS(ISNULL(dp.strike_price,0) - ISNULL(so.strike_price,0)) < 0.01)
+                AND (dp.option_type = so.option_type OR (dp.option_type IS NULL AND so.option_type IS NULL))
+            LEFT JOIN symbol_master sm
+                ON (UPPER(sm.bse_symbol) = so.symbol OR UPPER(sm.nse_symbol) = so.symbol)
+                AND sm.is_active = 1
+            WHERE so.order_id IN (${idList})
+            ORDER BY so.exchange, so.segment, so.placed_at
         `);
 
         const orders = ordersResult.recordset;
@@ -228,14 +241,29 @@ router.post('/download', adminAuthenticate, async (req, res) => {
             return res.status(404).json({ error: 'No orders found.' });
         }
 
-        // Fetch slice quantities
-        const sliceResult = await pool.request().query(`
-            SELECT symbol, slice_qty FROM slice_qty_master
-        `);
-        const sliceMap = {};
-        sliceResult.recordset.forEach(r => {
-            sliceMap[r.symbol.toUpperCase()] = r.slice_qty;
+        // Resolve BSE scrip code: prefer the live per-contract code from
+        // day_positions (correct for F&O — symbol_master has no per-contract
+        // columns), fall back to the equity-level symbol_master mapping (CM).
+        // No effect on NSE orders — NEAT rows never reference scrip_code.
+        orders.forEach(o => {
+            o.scrip_code = o.dp_scrip_code || o.sm_scrip_code || null;
         });
+
+        // Fetch slice quantities — non-fatal: if slice_qty_master doesn't exist
+        // or the query fails for any reason, fall back to no slicing rather than
+        // taking down the entire download (NSE included). Same defensive pattern
+        // already used for the lot_size_master lookup in rmsEmailAlert.js.
+        let sliceMap = {};
+        try {
+            const sliceResult = await pool.request().query(`
+                SELECT symbol, slice_qty FROM slice_qty_master
+            `);
+            sliceResult.recordset.forEach(r => {
+                sliceMap[r.symbol.toUpperCase()] = r.slice_qty;
+            });
+        } catch (e) {
+            console.error('[OrderDownload] slice_qty_master lookup failed (continuing without slicing):', e.message);
+        }
 
         // Group orders by exchange+segment
         const nseCM = orders.filter(o => o.exchange === 'NSE' && o.segment === 'CM');
@@ -248,6 +276,7 @@ router.post('/download', adminAuthenticate, async (req, res) => {
         const fileTime = formatFileTime(now);
 
         const files = [];
+        const blockedOrders = []; // BSE orders whose scrip code couldn't be resolved
 
         // ── NEAT NSE CM (txt) ────────────────────────────────────────────────
         if (nseCM.length > 0) {
@@ -263,7 +292,8 @@ router.post('/download', adminAuthenticate, async (req, res) => {
                 content:     lines.join('\r\n'),
                 contentType: 'text/plain',
                 exchange:    'NSE',
-                segment:     'CM'
+                segment:     'CM',
+                orderIds:    nseCM.map(o => o.order_id)
             });
         }
 
@@ -283,12 +313,25 @@ router.post('/download', adminAuthenticate, async (req, res) => {
                 content:     lines.join('\r\n'),
                 contentType: 'text/plain',
                 exchange:    'NSE',
-                segment:     'FO'
+                segment:     'FO',
+                orderIds:    nseFO.map(o => o.order_id)
             });
         }
 
         // ── BOLT BSE CM (xlsx) ───────────────────────────────────────────────
-        if (bseCM.length > 0) {
+        const bseCMUnresolved = bseCM.filter(o => !o.scrip_code);
+        if (bseCMUnresolved.length > 0) {
+            // Block the WHOLE group, not just the unresolved rows — otherwise a
+            // resolved sibling order silently disappears from the response with
+            // no file and no blocked-list entry to explain why.
+            blockedOrders.push(...bseCM.map(o => ({
+                order_id: o.order_id, ucc: o.ucc, exchange: o.exchange,
+                segment: o.segment, symbol: o.symbol,
+                reason: o.scrip_code
+                    ? 'Blocked because another order in the same BSE CM batch has no resolvable scrip code.'
+                    : 'No BSE scrip code found in day_positions or symbol_master.'
+            })));
+        } else if (bseCM.length > 0) {
             const workbook  = new ExcelJS.Workbook();
             const worksheet = workbook.addWorksheet('Orders');
             worksheet.columns = [
@@ -318,12 +361,23 @@ router.post('/download', adminAuthenticate, async (req, res) => {
                 content:     buffer,
                 contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                 exchange:    'BSE',
-                segment:     'CM'
+                segment:     'CM',
+                orderIds:    bseCM.map(o => o.order_id)
             });
         }
 
         // ── BOLT BSE FO (xlsx) ───────────────────────────────────────────────
-        if (bseFO.length > 0) {
+        const bseFOUnresolved = bseFO.filter(o => !o.scrip_code);
+        if (bseFOUnresolved.length > 0) {
+            // Block the WHOLE group — see comment on the BSE CM block above.
+            blockedOrders.push(...bseFO.map(o => ({
+                order_id: o.order_id, ucc: o.ucc, exchange: o.exchange,
+                segment: o.segment, symbol: o.symbol,
+                reason: o.scrip_code
+                    ? 'Blocked because another order in the same BSE FO batch has no resolvable scrip code.'
+                    : 'No BSE scrip code found in day_positions or symbol_master.'
+            })));
+        } else if (bseFO.length > 0) {
             const workbook  = new ExcelJS.Workbook();
             const worksheet = workbook.addWorksheet('Orders');
             worksheet.columns = [
@@ -355,29 +409,47 @@ router.post('/download', adminAuthenticate, async (req, res) => {
                 content:     buffer,
                 contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                 exchange:    'BSE',
-                segment:     'FO'
+                segment:     'FO',
+                orderIds:    bseFO.map(o => o.order_id)
             });
         }
 
-        // ── Mark orders as file generated ────────────────────────────────────
-        const updateRequest = pool.request();
-        order_ids.forEach((id, i) => updateRequest.input(`id${i}`, sql.UniqueIdentifier, id));
-        await updateRequest.query(`
-            UPDATE squareoff_orders
-            SET file_generated    = 1,
-                file_generated_at = GETDATE()
-            WHERE order_id IN (${idList})
-        `);
+        // ── Mark orders as file generated — ONLY orders actually included in a
+        // generated file. Blocked BSE orders (unresolved scrip code) are left
+        // untouched so they're never falsely marked as generated.
+        const generatedOrderIds = files.flatMap(f => f.orderIds || []);
+        if (generatedOrderIds.length > 0) {
+            const updateRequest = pool.request();
+            const genIdList = generatedOrderIds.map((_, i) => `@gid${i}`).join(',');
+            generatedOrderIds.forEach((id, i) => updateRequest.input(`gid${i}`, sql.UniqueIdentifier, id));
+            await updateRequest.query(`
+                UPDATE squareoff_orders
+                SET file_generated    = 1,
+                    file_generated_at = GETDATE()
+                WHERE order_id IN (${genIdList})
+            `);
+        }
 
         // ── Return file info for frontend to download ─────────────────────────
-        if (files.length === 1) {
+        // Single-file direct-download path only fires when nothing was blocked —
+        // this keeps existing NSE-only downloads byte-for-byte unchanged. Any BSE
+        // resolution failure switches to the JSON response so the admin sees
+        // exactly what couldn't be generated, instead of silently losing it.
+        if (files.length === 1 && blockedOrders.length === 0) {
             const file = files[0];
             res.setHeader('Content-Disposition', `attachment; filename="${file.filename}"`);
             res.setHeader('Content-Type', file.contentType);
             return res.send(file.content);
         }
 
-        // Multiple files — return as JSON with base64
+        if (files.length === 0 && blockedOrders.length > 0) {
+            return res.status(422).json({
+                error: 'Could not resolve BSE scrip code for the selected order(s). No file generated.',
+                blocked: blockedOrders
+            });
+        }
+
+        // Multiple files (or a mix of generated + blocked) — return as JSON with base64
         const responseFiles = files.map(f => ({
             filename:    f.filename,
             contentType: f.contentType,
@@ -388,7 +460,11 @@ router.post('/download', adminAuthenticate, async (req, res) => {
                 : Buffer.from(f.content).toString('base64')
         }));
 
-        return res.json({ success: true, files: responseFiles });
+        return res.json({
+            success: true,
+            files: responseFiles,
+            ...(blockedOrders.length > 0 ? { blocked: blockedOrders } : {})
+        });
 
     } catch (err) {
         console.error('[OrderDownload] Error:', err.message);
