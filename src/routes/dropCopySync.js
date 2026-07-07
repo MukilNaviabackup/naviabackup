@@ -33,16 +33,61 @@ router.post('/sync', validateSyncKey, async (req, res) => {
         if (hasPositions) {
             positions = preAggPositions;
         } else {
+            // ── DropCopy duplicate-trade guard ────────────────────────────────
+            // Some BSE DropCopy files report the exact same trade twice (confirmed
+            // against real 06-Jul-2026 Trade_BSE_CM/FO files: every duplicate pair
+            // shares ClntId + TradQty + UnqTradIdr + OrdrRef with zero exceptions
+            // across 6,472 checked rows; UnqTradIdr alone is NOT safe to dedupe on
+            // since it collides across unrelated trades, and exact TradDtTm is NOT
+            // safe to require either, since resends can arrive seconds to hours
+            // later with a bumped timestamp). Without a code change here, every
+            // resent trade silently doubles buy_qty/sell_qty/net_qty in
+            // day_positions - this was the root cause of a client's 1-share order
+            // showing as 2 in Navia Backup.
+            //
+            // If the upstream caller forwards the exchange's own trade identifiers
+            // (unq_trad_idr/unqTradIdr/UnqTradIdr and ordr_ref/ordrRef/OrdrRef),
+            // dedupe using the exact verified key. If it does not forward them
+            // (current payload shape has no such fields), fall back to an exact
+            // full-tuple match on every field this endpoint already receives -
+            // still a safe backstop, since a genuine DropCopy resend reproduces
+            // every field identically, and two independent real fills sharing
+            // identical ucc+symbol+side+qty+price+contract-details within one
+            // sync batch is not a realistic scenario for this platform.
+            const seenTradeKeys = new Set();
+            let duplicatesSkipped = 0;
+
             const positionMap = new Map();
             for (const trade of trades) {
                 const { ucc, symbol, isin, company_name, instrument_type,
                         expiry_date, strike_price, option_type,
-                        side, quantity, price, lot_size } = trade;
+                        side, quantity, price, lot_size,
+                        unq_trad_idr, unqTradIdr, UnqTradIdr,
+                        ordr_ref, ordrRef, OrdrRef } = trade;
                 if (!ucc || !symbol || !side || !quantity) continue;
                 const qty = parseFloat(quantity) || 0;
                 const px  = parseFloat(price)    || 0;
                 const lot = parseInt(lot_size)   || 1;
                 if (qty <= 0) continue;
+
+                const tradeUtid = unq_trad_idr || unqTradIdr || UnqTradIdr || null;
+                const tradeOref = ordr_ref     || ordrRef     || OrdrRef     || null;
+                // FIX (07-Jul-2026): include symbol in the UTID-branch key too --
+                // a multi-scrip BSE basket square-off can report the same
+                // UnqTradIdr+OrdrRef across different symbols in the same basket
+                // (all legs execute together), which the old key wrongly treated
+                // as a duplicate and dropped. Confirmed against a real BSE CM file
+                // where UCC 59784853's POWERGRID and BEL SELL legs shared the same
+                // UnqTradIdr/OrdrRef -- BEL's leg was silently discarded before this fix.
+                const dedupeKey = (tradeUtid && tradeOref)
+                    ? `UTID|${ucc}|${symbol.trim()}|${quantity}|${tradeUtid}|${tradeOref}`
+                    : `FULL|${ucc}|${symbol.trim()}|${expiry_date||''}|${strike_price||''}|${option_type||''}|${side.toUpperCase()}|${quantity}|${price}`;
+                if (seenTradeKeys.has(dedupeKey)) {
+                    duplicatesSkipped++;
+                    continue;
+                }
+                seenTradeKeys.add(dedupeKey);
+
                 const lotQty = lot > 0 ? qty / lot : qty;
                 const isBuy  = side.toUpperCase() === 'B';
                 const key    = `${ucc}|${symbol.trim()}|${expiry_date||''}|${strike_price||''}|${option_type||''}`;
@@ -64,6 +109,10 @@ router.post('/sync', validateSyncKey, async (req, res) => {
                 if (isBuy) { pos.buy_qty += lotQty; pos.buy_value += lotQty * px; }
                 else        { pos.sell_qty += lotQty; pos.sell_value += lotQty * px; }
             }
+            if (duplicatesSkipped > 0) {
+                console.log(`[DropCopy] Skipped ${duplicatesSkipped} duplicate trade row(s) (exact repeat within this sync batch)`);
+            }
+
             for (const pos of positionMap.values()) {
                 positions.push({
                     ucc:             pos.ucc,
