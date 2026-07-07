@@ -370,7 +370,8 @@ router.post('/client-data', async (req, res) => {
                 .query(`SELECT order_id, ucc, exchange, segment, symbol,
                                quantity, executed_qty, remaining_qty,
                                side, status, placed_at, placed_by, dealer_id,
-                               expiry_date, strike_price, option_type
+                               expiry_date, strike_price, option_type,
+                               file_generated, file_generated_at
                         FROM squareoff_orders
                         WHERE ucc = @ucc
                         ORDER BY placed_at DESC`)
