@@ -44,6 +44,26 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(securityLogger);
 app.use(suspiciousRequestFilter);
 
+// ── No-cache for ALL API responses ────────────────────────────────────────────
+// Every /api/* response reflects live trading data that can change within
+// seconds (order status, positions, quantities). Without an explicit no-store
+// directive, a browser's own HTTP cache, a corporate/office network proxy, or
+// any CDN sitting in front of this server can silently serve a stale cached
+// copy of any endpoint's response. This was confirmed as the cause of a client
+// placing/squaring off an order from mobile and still seeing the old state on
+// a web session no matter how many times "Refresh" was clicked -- the browser
+// never actually re-asked the server. Applied globally, once, here, so every
+// current AND future /api endpoint is covered automatically -- no route can
+// forget to set this individually. (Two routes -- /orders/my-orders and
+// /dropcopy/positions -- already had this added directly as an immediate fix;
+// this makes it universal and removes the need to patch routes one by one.)
+app.use('/api', (req, res, next) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    next();
+});
+
 // Rate limiter — exclude dropcopy from general limiter
 app.use('/api/', (req, res, next) => {
     // Exclude high-frequency and critical routes from general rate limiter
