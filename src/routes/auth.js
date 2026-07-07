@@ -5,6 +5,28 @@ const { getConnection, sql } = require('../config/database');
 const { generateAndSendOTP, verifyOTP } = require('../services/otpService');
 require('dotenv').config();
 
+/* ── Masking helpers for OTP screen display ──────────────────────────────────
+ * Mask the client's own registered mobile/email before sending to the
+ * frontend, so the OTP screen can show "OTP sent to ******5065 and
+ * ela*****@*****.***" instead of a generic message -- without ever
+ * transmitting the full mobile/email over this endpoint. */
+function maskMobile(mobile) {
+    if (!mobile) return '';
+    const digits = mobile.toString().trim();
+    if (digits.length <= 4) return digits;
+    return '*'.repeat(digits.length - 4) + digits.slice(-4);
+}
+function maskEmail(email) {
+    if (!email) return '';
+    const parts = email.split('@');
+    if (parts.length !== 2) return email;
+    const [local, domain] = parts;
+    const visibleLen   = Math.min(3, local.length);
+    const maskedLocal   = local.slice(0, visibleLen) + '*'.repeat(Math.max(local.length - visibleLen, 1));
+    const maskedDomain  = domain.split('.').map(p => '*'.repeat(p.length)).join('.');
+    return `${maskedLocal}@${maskedDomain}`;
+}
+
 /* ── Helper: write to system_logs (non-blocking) ────────────────────────────*/
 // Fire-and-forget system log writer — NEVER throws, NEVER blocks response
 function writeLog(logType, actor, actorType, ucc, ipAddress, details, status) {
@@ -72,10 +94,12 @@ router.post('/login/initiate', async (req, res) => {
             `OTP dispatched | Mobile:${client.mobile} | Email:${client.email} | SMS+Email in background`, 'SUCCESS');
 
         return res.json({
-            success:    true,
+            success:      true,
             sessionId,
-            message:    'OTP sent to registered mobile and email.',
-            clientName: client.client_name
+            message:      'OTP sent to registered mobile and email.',
+            clientName:   client.client_name,
+            maskedMobile: maskMobile(client.mobile),
+            maskedEmail:  maskEmail(client.email)
         });
 
     } catch (err) {
