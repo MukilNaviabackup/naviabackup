@@ -195,8 +195,8 @@ router.post('/login/verify-otp', async (req, res) => {
                 .query('UPDATE dealer_otp_sessions SET attempt_count=attempt_count+1 WHERE session_id=@sessionId');
             const remaining = 2 - session.attempt_count;
             writeLog('DEALER_LOGIN_FAILED', dealerIdValue, 'DEALER', null, ip, 'Invalid OTP attempt', 'FAILED');
-            return res.status(401).json({ 
-                error: `Incorrect OTP. Please check the latest email sent to your registered address. ${remaining > 0 ? remaining + ' attempt(s) remaining.' : 'Click Back and request a new OTP.'}` 
+            return res.status(401).json({
+                error: `Incorrect OTP. Please check the latest email sent to your registered address. ${remaining > 0 ? remaining + ' attempt(s) remaining.' : 'Click Back and request a new OTP.'}`
             });
         }
 
@@ -370,8 +370,7 @@ router.post('/client-data', async (req, res) => {
                 .query(`SELECT order_id, ucc, exchange, segment, symbol,
                                quantity, executed_qty, remaining_qty,
                                side, status, placed_at, placed_by, dealer_id,
-                               expiry_date, strike_price, option_type,
-                               file_generated, file_generated_at
+                               expiry_date, strike_price, option_type
                         FROM squareoff_orders
                         WHERE ucc = @ucc
                         ORDER BY placed_at DESC`)
@@ -429,7 +428,7 @@ router.post('/client-data', async (req, res) => {
         console.error('[ClientData] ERROR:', err.message, err.stack);
         if (err.name === 'TokenExpiredError') return res.status(401).json({ error: 'Session expired. Please login again.' });
         // Return full error detail to help debug
-        return res.status(500).json({ 
+        return res.status(500).json({
             error: 'Failed to load client data: ' + err.message,
             detail: err.message
         });
@@ -473,23 +472,79 @@ router.post('/place-squareoff', async (req, res) => {
             return res.status(403).json({ error: 'SEGMENT_DISABLED', message: 'Trading application is functioning normally.' });
         }
 
-        // Check duplicate
+        // ── Check duplicate ───────────────────────────────────────────────────
+        // Fixed to match the client route's logic exactly (orders.js /squareoff):
+        // - Must also exclude ORDER_TRADED/TRADED as resolved -- the old version
+        //   here only excluded REJECTED/FAILED, so an already-successfully-traded
+        //   order for this symbol earlier today would wrongly keep blocking new
+        //   square-offs for the rest of the day.
+        // - Must also match expiry_date/strike_price/option_type -- the old
+        //   version matched only symbol+exchange+segment, so two DIFFERENT
+        //   contracts of the same symbol (e.g. GOLDPETAL 31/7 FUT vs 31/8 FUT)
+        //   would incorrectly conflict with each other.
         const dupCheck = await pool.request()
-            .input('ucc',     sql.VarChar(20), ucc)
-            .input('symbol',  sql.VarChar(100), symbol)
-            .input('exchange',sql.VarChar(10),  exchange)
-            .input('segment', sql.VarChar(10),  segment)
+            .input('ucc',        sql.VarChar(20),  ucc)
+            .input('symbol',     sql.VarChar(100), symbol)
+            .input('exchange',   sql.VarChar(10),  exchange)
+            .input('segment',    sql.VarChar(10),  segment)
+            .input('expiry',     sql.Date,          expiry_date  ? new Date(expiry_date)  : null)
+            .input('strike',     sql.Decimal(18,2), strike_price ? Number(strike_price)   : null)
+            .input('optionType', sql.VarChar(5),    option_type  || null)
             .query(`SELECT order_id FROM squareoff_orders
                     WHERE ucc = @ucc AND symbol = @symbol
                     AND exchange = @exchange AND segment = @segment
-                    AND status NOT IN ('REJECTED','FAILED')
-                    AND CAST(placed_at AS DATE) = CAST(GETDATE() AS DATE)`);
+                    AND status NOT IN ('FAILED','REJECTED','ORDER_TRADED','TRADED')
+                    AND CAST(placed_at AS DATE) = CAST(GETDATE() AS DATE)
+                    AND (expiry_date  = @expiry     OR (@expiry     IS NULL AND expiry_date  IS NULL))
+                    AND (ABS(ISNULL(strike_price,0) - ISNULL(@strike,0)) < 0.01)
+                    AND (option_type  = @optionType OR (@optionType IS NULL AND option_type  IS NULL))`);
         if (dupCheck.recordset.length > 0) {
-            return res.status(409).json({ error: 'DUPLICATE_ORDER', message: 'Square-off already placed for this security.' });
+            return res.status(409).json({ error: 'DUPLICATE_ORDER', message: 'A square-off order has already been placed for this security.' });
         }
 
         const client  = clientCheck.recordset[0];
         const orderId = 'SQ' + Date.now() + Math.random().toString(36).slice(2,6).toUpperCase();
+
+        // ── Capture baseline qty for reconciliation (compliance fix) ──────────
+        // Same fix as orders.js /squareoff: day_positions.buy_qty/sell_qty are
+        // CUMULATIVE totals for the whole trading day, not a per-trade log. This
+        // route did not previously capture a baseline at all, meaning dealer-
+        // placed orders were NOT protected by the reconciliation fix for the
+        // 2026-07-08 IDEA false-match incident (a brand-new order could still be
+        // matched against an older, already-closed trade from earlier the same
+        // day). Snapshot the current cumulative quantity now, at placement time.
+        const baselineSideCol = side.toUpperCase() === 'BUY' ? 'buy_qty' : 'sell_qty';
+        const baselineResult = await pool.request()
+            .input('ucc',        sql.VarChar(20),  ucc)
+            .input('symbol',     sql.VarChar(100), symbol)
+            .input('exchange',   sql.VarChar(10),  exchange)
+            .input('segment',    sql.VarChar(10),  segment)
+            .input('expiry',     sql.Date,          expiry_date  ? new Date(expiry_date)  : null)
+            .input('strike',     sql.Decimal(18,2), strike_price ? Number(strike_price)   : null)
+            .input('optionType', sql.VarChar(5),    option_type  || null)
+            .query(`
+                SELECT ISNULL(SUM(${baselineSideCol}), 0) AS baseline_qty
+                FROM day_positions
+                WHERE ucc          = @ucc
+                AND   symbol       = @symbol
+                AND   exchange     = @exchange
+                AND   segment      = @segment
+                AND   trade_date   = CAST(GETDATE() AS DATE)
+                AND   (
+                    (@expiry IS NULL AND expiry_date IS NULL)
+                    OR expiry_date = @expiry
+                )
+                AND   (
+                    (@strike IS NULL AND strike_price IS NULL)
+                    OR ABS(strike_price - @strike) < 0.01
+                )
+                AND   (
+                    (@optionType IS NULL AND option_type IS NULL)
+                    OR option_type = @optionType
+                )
+            `);
+        const baselineQty = Number(baselineResult.recordset[0]?.baseline_qty) || 0;
+        console.log(`[DealerOrders] Baseline qty captured = ${baselineQty} (${baselineSideCol}) for order ${orderId}`);
 
         await pool.request()
             .input('orderId',     sql.VarChar(50),   orderId)
@@ -505,16 +560,17 @@ router.post('/place-squareoff', async (req, res) => {
             .input('expiry',      sql.Date,          expiry_date  ? new Date(expiry_date)  : null)
             .input('strike',      sql.Decimal(18,2), strike_price || null)
             .input('optionType',  sql.VarChar(5),    option_type  || null)
+            .input('baselineQty', sql.Decimal(18,2), baselineQty)
             .query(`INSERT INTO squareoff_orders
                     (order_id, ucc, exchange, segment, symbol, quantity, side,
                      status, client_name, placed_by, dealer_id,
                      expiry_date, strike_price, option_type, placed_at,
-                     executed_qty, remaining_qty)
+                     executed_qty, remaining_qty, baseline_qty)
                     VALUES
                     (@orderId, @ucc, @exchange, @segment, @symbol, @quantity, @side,
                      'ORDER_RECEIVED', @clientName, @placedBy, @dealerId,
                      @expiry, @strike, @optionType, GETDATE(),
-                     0, @quantity)`);
+                     0, @quantity, @baselineQty)`);
 
         return res.json({ success: true, orderId, message: 'Square-off placed successfully.' });
 
