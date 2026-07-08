@@ -2,7 +2,7 @@
 const { getConnection, sql } = require('../config/database');
 const { notifyTradeStatusChange } = require('./tradeNotification');
 
-// ── Run every 5 seconds ───────────────────────────────────────────────────────
+// ── Run every 30 seconds ───────────────────────────────────────────────────────
 const RECON_INTERVAL_MS = 30000; // 30s — reduces DB load on Azure SQL S1
 
 // ── Status constants ──────────────────────────────────────────────────────────
@@ -45,7 +45,7 @@ async function reconcile() {
         const openOrders = await pool.request().query(`
             SELECT order_id, ucc, exchange, segment, symbol, isin,
                    side, quantity, executed_qty, remaining_qty,
-                   status, placed_at, trade_price,
+                   status, placed_at, trade_price, baseline_qty,
                    expiry_date, strike_price, option_type
             FROM squareoff_orders
             WHERE status IN ('FILE_GENERATED','PARTIALLY_TRADED')
@@ -76,21 +76,39 @@ async function reconcileOrder(pool, order) {
                  ['FO','NSEFO','NFO'].includes((order.segment||'').toUpperCase().trim());
     const isCM = order.segment === 'CM' || ['CM','NSECM','BSECM'].includes((order.segment||'').toUpperCase().trim());
 
-    let executedQty = 0;
-    let tradePrice  = null;
+    let rawExecutedQty = 0;
+    let tradePrice      = null;
 
     if (isFO) {
-        ({ executedQty, tradePrice } = await getFOExecutedQty(pool, order));
+        ({ executedQty: rawExecutedQty, tradePrice } = await getFOExecutedQty(pool, order));
     } else if (isCM) {
-        ({ executedQty, tradePrice } = await getCMExecutedQty(pool, order));
+        ({ executedQty: rawExecutedQty, tradePrice } = await getCMExecutedQty(pool, order));
     } else {
         const isMCX = (order.exchange || '').toUpperCase() === 'MCX';
         if (isMCX) {
-            ({ executedQty, tradePrice } = await getFOExecutedQty(pool, order));
+            ({ executedQty: rawExecutedQty, tradePrice } = await getFOExecutedQty(pool, order));
         } else {
             return;
         }
     }
+
+    // ── Compliance fix (2026-07-08 IDEA false-match incident) ────────────────
+    // day_positions.buy_qty/sell_qty are CUMULATIVE totals for the whole trading
+    // day, not a per-trade log. A client who completes more than one buy/sell
+    // round-trip in the same symbol on the same day will have "leftover" qty
+    // sitting in that cumulative column from an EARLIER, already-closed
+    // round-trip. The previous version of this function summed that cumulative
+    // column directly and only gated it on day_positions.last_updated > placed_at
+    // -- a check that verifies the ROW was recently touched, not that the
+    // QUANTITY it holds is actually new. That let a brand-new square-off order
+    // get matched (and the client told "successfully executed") against a trade
+    // that happened BEFORE the order was even placed.
+    //
+    // Fix: subtract the baseline quantity that was snapshotted on this order at
+    // the moment it was placed (see orders.js /squareoff -- baseline_qty). Only
+    // the genuine INCREMENT since placement counts as "executed" for this order.
+    const baselineQty = Number(order.baseline_qty) || 0;
+    const executedQty = Math.max(0, rawExecutedQty - baselineQty);
 
     const requestedQty  = Number(order.quantity)     || 0;
     const prevExecuted  = Number(order.executed_qty) || 0;
@@ -111,7 +129,8 @@ async function reconcileOrder(pool, order) {
     if (newStatus === order.status && executedQty === 0) return;
 
     console.log(`[Recon] ${order.order_id} | ${order.symbol} | ${order.ucc} | ` +
-                `${order.status} → ${newStatus} | Exec:${executedQty}/${requestedQty}`);
+                `${order.status} → ${newStatus} | Exec:${executedQty}/${requestedQty} ` +
+                `(raw:${rawExecutedQty} baseline:${baselineQty})`);
 
     // Update squareoff_orders
     await pool.request()
@@ -159,7 +178,8 @@ async function reconcileOrder(pool, order) {
 
 // ── FO Matching ───────────────────────────────────────────────────────────────
 // Match: UCC + symbol + exchange + segment + expiry + strike + option_type
-// Trade time must be AFTER order placed_at
+// Returns the RAW cumulative day quantity for the matching side; the caller
+// (reconcileOrder) subtracts order.baseline_qty to get the genuine increment.
 async function getFOExecutedQty(pool, order) {
     const sideCol   = (order.side || '').toUpperCase() === 'BUY' ? 'buy_qty'       : 'sell_qty';
     const priceCol  = (order.side || '').toUpperCase() === 'BUY' ? 'avg_buy_price' : 'avg_sell_price';
@@ -168,7 +188,6 @@ async function getFOExecutedQty(pool, order) {
         .input('ucc',         sql.VarChar(20),   order.ucc)
         .input('symbol',      sql.VarChar(50),   order.symbol)
         .input('exchange',    sql.VarChar(10),   order.exchange)
-        .input('placedAt',    sql.DateTime,      new Date(order.placed_at))
         .input('expiry',      sql.Date,          order.expiry_date ? new Date(order.expiry_date) : null)
         .input('strike',      sql.Decimal(18,2), order.strike_price || null)
         .input('optionType',  sql.VarChar(5),    order.option_type || null)
@@ -179,7 +198,6 @@ async function getFOExecutedQty(pool, order) {
             WHERE ucc          = @ucc
             AND   symbol       = @symbol
             AND   exchange     = @exchange
-            AND   last_updated > @placedAt
             AND   trade_date   = CAST(GETDATE() AS DATE)
             AND   (
                 (@expiry IS NULL AND expiry_date IS NULL)
@@ -203,7 +221,7 @@ async function getFOExecutedQty(pool, order) {
 
 // ── CM Matching ───────────────────────────────────────────────────────────────
 // Match: UCC + ISIN (via symbol_master) + exchange + trade date
-// Trade time must be AFTER order placed_at
+// Returns the RAW cumulative day quantity; caller subtracts order.baseline_qty.
 async function getCMExecutedQty(pool, order) {
     if (!order.isin) {
         return getCMExecutedQtyBySymbol(pool, order);
@@ -215,7 +233,6 @@ async function getCMExecutedQty(pool, order) {
     const result = await pool.request()
         .input('ucc',      sql.VarChar(20),  order.ucc)
         .input('isin',     sql.VarChar(20),  order.isin)
-        .input('placedAt', sql.DateTime,     new Date(order.placed_at))
         .query(`
             SELECT SUM(dp.${sideCol}) AS executed_qty,
                    SUM(dp.${priceCol} * dp.${sideCol}) / NULLIF(SUM(dp.${sideCol}),0) AS trade_price
@@ -223,7 +240,6 @@ async function getCMExecutedQty(pool, order) {
             JOIN symbol_master sm ON dp.symbol = sm.nse_symbol OR dp.symbol = sm.bse_symbol
             WHERE dp.ucc          = @ucc
             AND   sm.isin         = @isin
-            AND   dp.last_updated > @placedAt
             AND   dp.trade_date   = CAST(GETDATE() AS DATE)
             AND   dp.segment      = 'CM'
         `);
@@ -244,7 +260,6 @@ async function getCMExecutedQtyBySymbol(pool, order) {
         .input('ucc',      sql.VarChar(20),  order.ucc)
         .input('symbol',   sql.VarChar(100), order.symbol.trim())
         .input('exchange', sql.VarChar(10),  order.exchange)
-        .input('placedAt', sql.DateTime,     new Date(order.placed_at))
         .query(`
             SELECT SUM(dp.${sideCol}) AS executed_qty,
                    SUM(dp.${priceCol} * dp.${sideCol}) / NULLIF(SUM(dp.${sideCol}),0) AS trade_price
@@ -253,7 +268,6 @@ async function getCMExecutedQtyBySymbol(pool, order) {
             AND   dp.symbol       = @symbol
             AND   dp.exchange     = @exchange
             AND   dp.segment      = 'CM'
-            AND   dp.last_updated > @placedAt
             AND   dp.trade_date   = CAST(GETDATE() AS DATE)
         `);
 
@@ -283,7 +297,6 @@ async function getCMExecutedQtyBySymbol(pool, order) {
         .input('ucc',       sql.VarChar(20), order.ucc)
         .input('nseSymbol', sql.VarChar(50), nseSymbol)
         .input('bseSymbol', sql.VarChar(50), bseSymbol)
-        .input('placedAt',  sql.DateTime,    new Date(order.placed_at))
         .query(`
             SELECT SUM(dp.${sideCol}) AS executed_qty,
                    SUM(dp.${priceCol} * dp.${sideCol}) / NULLIF(SUM(dp.${sideCol}),0) AS trade_price
@@ -291,7 +304,6 @@ async function getCMExecutedQtyBySymbol(pool, order) {
             WHERE dp.ucc      = @ucc
             AND  (dp.symbol   = @nseSymbol OR dp.symbol = @bseSymbol)
             AND   dp.segment  = 'CM'
-            AND   dp.last_updated > @placedAt
             AND   dp.trade_date   = CAST(GETDATE() AS DATE)
         `);
 
@@ -303,10 +315,10 @@ async function getCMExecutedQtyBySymbol(pool, order) {
 
 // ── Start service ─────────────────────────────────────────────────────────────
 function startReconciliationService() {
-    console.log('[Recon] Trade reconciliation service starting — interval: 5s');
+    console.log('[Recon] Trade reconciliation service starting — interval: 30s');
     // Run immediately on start
     reconcile();
-    // Then every 5 seconds
+    // Then every 30 seconds
     setInterval(reconcile, RECON_INTERVAL_MS);
 }
 

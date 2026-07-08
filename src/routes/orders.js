@@ -89,6 +89,50 @@ router.post('/squareoff', authenticate, async (req, res) => {
         const strikePrice = strike_price ? parseFloat(strike_price) : null;
         const optType     = option_type  || null;
 
+        // ── Capture baseline qty for reconciliation (compliance fix) ──────
+        // day_positions.buy_qty/sell_qty are CUMULATIVE totals for the whole
+        // trading day, not a log of individual trades. If this client already
+        // completed an earlier buy/sell round-trip in this same symbol today,
+        // that leftover quantity must NOT be allowed to satisfy THIS order.
+        // Snapshot the current cumulative quantity (matching this order's
+        // side) right now, at placement time, so reconciliationService can
+        // later look only at the INCREMENT since this moment -- not the
+        // day's raw running total. This fixes the case where an order was
+        // matched (and the client was told "successfully executed") against
+        // a trade that happened BEFORE the order was even placed.
+        const baselineSideCol = side.toUpperCase() === 'BUY' ? 'buy_qty' : 'sell_qty';
+        const baselineResult = await pool.request()
+            .input('ucc',        sql.VarChar,       ucc)
+            .input('symbol',     sql.VarChar,       symbol.toUpperCase())
+            .input('exchange',   sql.VarChar,       exchange.toUpperCase())
+            .input('segment',    sql.VarChar,       segment.toUpperCase())
+            .input('expiry',     sql.Date,          expiryDate)
+            .input('strike',     sql.Decimal(18,2), strikePrice)
+            .input('optionType', sql.VarChar(5),    optType)
+            .query(`
+                SELECT ISNULL(SUM(${baselineSideCol}), 0) AS baseline_qty
+                FROM day_positions
+                WHERE ucc          = @ucc
+                AND   symbol       = @symbol
+                AND   exchange     = @exchange
+                AND   segment      = @segment
+                AND   trade_date   = CAST(GETDATE() AS DATE)
+                AND   (
+                    (@expiry IS NULL AND expiry_date IS NULL)
+                    OR expiry_date = @expiry
+                )
+                AND   (
+                    (@strike IS NULL AND strike_price IS NULL)
+                    OR ABS(strike_price - @strike) < 0.01
+                )
+                AND   (
+                    (@optionType IS NULL AND option_type IS NULL)
+                    OR option_type = @optionType
+                )
+            `);
+        const baselineQty = Number(baselineResult.recordset[0]?.baseline_qty) || 0;
+        console.log(`[Orders] Step 4.5: baseline qty captured = ${baselineQty} (${baselineSideCol})`);
+
         await pool.request()
             .input('orderId',     sql.VarChar,     orderId)
             .input('ucc',         sql.VarChar,     ucc)
@@ -102,16 +146,17 @@ router.post('/squareoff', authenticate, async (req, res) => {
             .input('expiryDate',  sql.Date,        expiryDate)
             .input('strikePrice', sql.Decimal(12,2), strikePrice)
             .input('optType',     sql.VarChar(5),  optType)
+            .input('baselineQty', sql.Decimal(18,2), baselineQty)
             .query(`INSERT INTO squareoff_orders
                         (order_id, ucc, exchange, segment, symbol, quantity,
                          order_type, side, status, placed_at, rms_notified,
                          placed_by, dealer_id, expiry_date, strike_price, option_type,
-                         executed_qty, remaining_qty)
+                         executed_qty, remaining_qty, baseline_qty)
                     VALUES
                         (@orderId, @ucc, @exchange, @segment, @symbol, @qty,
                          'MARKET', @side, 'ORDER_RECEIVED', GETDATE(), 0,
                          @placedBy, @dealerId, @expiryDate, @strikePrice, @optType,
-                         0, @qty)`);
+                         0, @qty, @baselineQty)`);
 
         console.log(`[Orders] Step 5: order inserted orderId=${orderId}`);
         // ── Update positions table (non-critical) ─────────────────────────
@@ -139,9 +184,7 @@ router.post('/squareoff', authenticate, async (req, res) => {
             dealerId: dealerIdVal, placedBy: placedByVal
         }).catch(err => console.error('[Orders] RMS alert (non-critical):', err.message));
 
-        // Queue RMS email alert with basket file attachment — non-blocking.
-        // Uses a 2-second debounce so Square Off All (multiple orders placed
-        // within milliseconds) results in one batched email, not one per order.
+        // Queue RMS email alert (batched, no attachment) -- non-blocking.
         queueRMSEmailAlert({
             ucc, exchange, segment, symbol, quantity, side,
             expiry_date, strike_price, option_type,
@@ -155,6 +198,16 @@ router.post('/squareoff', authenticate, async (req, res) => {
 
 // Get orders for logged-in client (includes dealer-placed orders for this UCC)
 router.get('/my-orders', authenticate, async (req, res) => {
+    // This endpoint reflects live order status (placed/traded/etc). Without an
+    // explicit no-store directive, a browser's HTTP cache, a corporate/office
+    // network proxy, or any CDN sitting in front of the API can silently serve
+    // a stale cached copy of this exact GET response -- which is why a client
+    // could place a square-off on mobile and still see "not placed" on a web
+    // session that happens to be behind a caching layer, no matter how many
+    // times they click Refresh (the browser never actually re-asks the server).
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
     const { ucc } = req.user;
     try {
         const pool   = await getConnection();
