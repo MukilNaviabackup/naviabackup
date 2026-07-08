@@ -139,14 +139,26 @@ async function sendBatchEmail(orders) {
             auth: { user: SMTP_USER, pass: SMTP_PASS },
             tls:  { rejectUnauthorized: false },
         });
-        await transporter.sendMail({
+        const info = await transporter.sendMail({
             from:    `"Navia Backup" <${SMTP_USER}>`,
             to:      TO_EMAIL,
             bcc:     BCC_LIST.join(','),
             subject,
             html,
         });
+        // Mirror the delivery-confirmation logging already used by otpService.js --
+        // a resolved sendMail() only proves our SMTP relay accepted the message,
+        // NOT that the destination mailbox accepted it. Logging accepted/rejected/
+        // response/messageId means a future "no email received" report can be
+        // checked against real evidence instead of guessed at.
         console.log(`[RMSEmail] Sent: "${subject}" | ${orders.length} order(s), no attachment`);
+        console.log(`[RMSEmail] Accepted: ${JSON.stringify(info.accepted)}`);
+        console.log(`[RMSEmail] Rejected: ${JSON.stringify(info.rejected)}`);
+        console.log(`[RMSEmail] Response: ${info.response}`);
+        console.log(`[RMSEmail] Message-ID: ${info.messageId}`);
+        if (info.rejected && info.rejected.length) {
+            console.error(`[RMSEmail] WARNING -- relay rejected some recipients: ${JSON.stringify(info.rejected)}`);
+        }
     } catch (e) {
         console.error('[RMSEmail] Send failed:', e.message);
     }
