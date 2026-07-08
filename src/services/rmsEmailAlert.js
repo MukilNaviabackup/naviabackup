@@ -41,7 +41,6 @@ const TO_LIST     = [
     'kiruthika@navia.co.in',
     'elamukil@navia.co.in',
 ];
-const ADMIN_PANEL_URL = process.env.ADMIN_PANEL_URL || 'https://backup.navia.co.in/admin';
 
 // ── Batching / debounce config ────────────────────────────────────────────────
 const DEBOUNCE_MS = 2000;   // wait this long after the LAST order before sending
@@ -88,12 +87,24 @@ async function sendBatchEmail(orders) {
         </tr>`;
     }).join('');
 
+    // FIX (2026-07-08): removed the clickable <a href> link to the admin panel.
+    // The DropCopy sync/staleness alert emails (sync_dropcopy.py) use the exact
+    // same SMTP relay, port, and sender account as this RMS alert and are
+    // received reliably -- ruling out a domain/relay authorization problem.
+    // The one structural difference between the two is that this email
+    // contained a clickable link; the DropCopy alert has none. A clickable
+    // link in a message about financial square-off actions, sent via an
+    // external relay, is a common trigger for anti-phishing/spam filtering
+    // (e.g. Microsoft 365 Safe Links / EOP) even when SPF/DKIM pass -- and
+    // this alert has gone undelivered (not even to Junk) for about a week.
+    // Spelling out the URL as plain text (no <a> tag) matches the working
+    // DropCopy alert's zero-link pattern exactly.
     const downloadNoteHtml = `
         <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px;
                     padding:11px 16px;font-size:12px;color:#1e3a8a">
-            <strong>Action required:</strong> Log in to the
-            <a href="${ADMIN_PANEL_URL}" style="color:#1d4ed8;font-weight:600">Navia Backup Admin Panel</a>
-            and download the basket file for the order${orders.length > 1 ? 's' : ''} listed above,
+            <strong>Action required:</strong> Log in to the Navia Backup Admin Panel
+            and download the basket file for the
+            order${orders.length > 1 ? 's' : ''} listed above,
             then upload it to the exchange terminal immediately.
         </div>`;
 
