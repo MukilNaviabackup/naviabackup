@@ -17,9 +17,14 @@
  * basket file for the orders listed in the email.
  *
  * Email:
- *   To:  surveillance@navia.co.in
- *   BCC: technology@navia.co.in, monicka@navia.co.in,
- *        kiruthika@navia.co.in, elamukil@navia.co.in
+ *   To: surveillance@navia.co.in, technology@navia.co.in, monicka@navia.co.in,
+ *       kiruthika@navia.co.in, elamukil@navia.co.in
+ *   (all recipients in direct To -- no BCC. The DropCopy sync alert emails from
+ *   sync_dropcopy.py address every recipient directly in To and are received
+ *   reliably; this RMS alert previously BCC'd everyone except surveillance@,
+ *   and was NOT being received -- BCC'd mail where the visible To goes to a
+ *   different address is treated more suspiciously by mail security filters.
+ *   Switching to direct To for everyone matches the working pattern.)
  */
 
 const nodemailer = require('nodemailer');
@@ -29,8 +34,8 @@ const SMTP_HOST   = process.env.SMTP_HOST     || 'smtp.zatpatmail.com';
 const SMTP_PORT   = 465;
 const SMTP_USER   = process.env.SMTP_USER     || 'updates@navia.co.in';
 const SMTP_PASS   = process.env.SMTP_PASSWORD;
-const TO_EMAIL    = 'surveillance@navia.co.in';
-const BCC_LIST    = [
+const TO_LIST     = [
+    'surveillance@navia.co.in',
     'technology@navia.co.in',
     'monicka@navia.co.in',
     'kiruthika@navia.co.in',
@@ -141,8 +146,7 @@ async function sendBatchEmail(orders) {
         });
         const info = await transporter.sendMail({
             from:    `"Navia Backup" <${SMTP_USER}>`,
-            to:      TO_EMAIL,
-            bcc:     BCC_LIST.join(','),
+            to:      TO_LIST.join(','),
             subject,
             html,
         });
