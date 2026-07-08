@@ -367,10 +367,19 @@ router.post('/client-data', async (req, res) => {
                 .query(`SELECT * FROM positions WHERE ucc = @ucc ORDER BY symbol`)
                 .catch(() => ({ recordset: [] })),
             pool.request().input('ucc', sql.VarChar(20), ucc.trim())
+                // file_generated / file_generated_at added: DealerDashboard.jsx's
+                // action-column logic requires ord.file_generated to show "Traded"
+                // (mirrors the client's own file_generated compliance gate), but
+                // this query never selected it -- so ord.file_generated was always
+                // undefined and the Traded/Partially-traded badges could never
+                // render here, regardless of actual order status. That's why the
+                // dealer view showed "No open position" for orders the client view
+                // correctly showed as Traded.
                 .query(`SELECT order_id, ucc, exchange, segment, symbol,
                                quantity, executed_qty, remaining_qty,
                                side, status, placed_at, placed_by, dealer_id,
-                               expiry_date, strike_price, option_type
+                               expiry_date, strike_price, option_type,
+                               file_generated, file_generated_at
                         FROM squareoff_orders
                         WHERE ucc = @ucc
                         ORDER BY placed_at DESC`)
