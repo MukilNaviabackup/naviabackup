@@ -155,11 +155,31 @@ async function sendBatchEmail(orders) {
             auth: { user: SMTP_USER, pass: SMTP_PASS },
             tls:  { rejectUnauthorized: false },
         });
+        // FIX (2026-07-09): after a week of non-delivery even with the link
+        // and admin-panel URL removed entirely (v5), the remaining problem is
+        // not the content -- it's two structural differences from the
+        // sync_dropcopy.py alert, which uses the SAME relay/port/account and
+        // IS received reliably:
+        //   1. Message-ID -- nodemailer was auto-generating one from the
+        //      container's hostname, producing "@emailapikey" as the domain
+        //      part instead of anything resembling navia.co.in. A Message-ID
+        //      domain that doesn't match the sending domain at all is a
+        //      signal some corporate mail filters (incl. Microsoft 365
+        //      Defender) weigh when scoring a message. sync_dropcopy.py never
+        //      hits this because it never sets Message-ID itself -- the relay
+        //      assigns one. Explicitly setting a navia.co.in Message-ID here
+        //      removes the mismatch either way.
+        //   2. From header -- previously `"Navia Backup" <updates@navia.co.in>`
+        //      (a display name attached to the address). sync_dropcopy.py
+        //      sends from the plain address with no display name. Matching
+        //      that exactly removes another difference from the known-good
+        //      pattern.
         const info = await transporter.sendMail({
-            from:    `"Navia Backup" <${SMTP_USER}>`,
-            to:      TO_LIST.join(','),
+            from:      SMTP_USER,
+            to:        TO_LIST.join(','),
             subject,
             html,
+            messageId: `<${Date.now()}.${Math.random().toString(36).slice(2)}@navia.co.in>`,
         });
         // Mirror the delivery-confirmation logging already used by otpService.js --
         // a resolved sendMail() only proves our SMTP relay accepted the message,
