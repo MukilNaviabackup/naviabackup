@@ -34,26 +34,27 @@ const SMTP_HOST   = process.env.SMTP_HOST     || 'smtp.zatpatmail.com';
 const SMTP_PORT   = 465;
 const SMTP_USER   = process.env.SMTP_USER     || 'updates@navia.co.in';
 const SMTP_PASS   = process.env.SMTP_PASSWORD;
+// FIX (2026-07-09, v9, ROOT CAUSE CONFIRMED): the diagnostic log revealed
+// SMTP_USER resolves to the literal string "emailapikey" in this
+// environment (an Azure App Service application setting), with a 144-char
+// API-key-style SMTP_PASSWORD -- NOT the "updates@navia.co.in" mailbox
+// account sync_dropcopy.py authenticates with. That's a legitimate,
+// separate SMTP AUTH login for ZatpatMail's API-key auth mode -- but this
+// file was also using SMTP_USER ("emailapikey") as the email's FROM
+// address, which is not a valid email address at all. The App Service
+// config has a DEDICATED `SMTP_FROM` setting for exactly this reason (auth
+// identity and sending identity are two different things for this relay);
+// this code just never read it. That mismatch -- authenticating fine, but
+// sending with an invalid/unverified From -- is consistent with every piece
+// of evidence so far: our logs show "250 accepted" (the login succeeds),
+// yet the message never shows up in ZatpatMail's dashboard for the
+// updates@navia.co.in account (because it was never sent AS that account).
+const SMTP_FROM   = process.env.SMTP_FROM     || 'updates@navia.co.in';
 
-// DIAGNOSTIC (2026-07-09): the ZatpatMail dashboard shows sync_dropcopy.py's
-// alert emails as captured/delivered, but this RMS alert's sends are NOT
-// captured there at all -- even though our own logs show the SMTP session
-// completing with "250 Message received". That combination means the RMS
-// alert is very likely not actually reaching ZatpatMail's real relay at
-// all, despite looking successful from inside this process. The one real
-// difference from sync_dropcopy.py (which hardcodes its SMTP_HOST/SMTP_USER
-// as plain Python string literals) is that this file reads them from
-// process.env first, falling back to the zatpatmail default only if unset.
-// If some environment variable named SMTP_HOST or SMTP_USER is set in this
-// process's environment to anything other than the intended values (a
-// leftover from another integration, a typo, a stale .env entry, etc.),
-// this code would silently connect to a completely different mail server
-// while still reporting success -- some relays/catch-alls accept and
-// silently drop mail. Logging the ACTUALLY RESOLVED values once at startup
-// (never the password itself, just whether it's set and its length) proves
-// or rules this out with real evidence instead of guessing further.
-// Remove this log once SMTP_HOST/SMTP_USER are confirmed correct.
-console.log(`[RMSEmail] DIAGNOSTIC -- resolved SMTP config: host="${SMTP_HOST}" port=${SMTP_PORT} user="${SMTP_USER}" passSet=${!!SMTP_PASS} passLen=${SMTP_PASS ? SMTP_PASS.length : 0}`);
+// DIAGNOSTIC (kept from v7/v8): logs the actually-resolved config at startup
+// (never the password itself, just whether it's set and its length) so any
+// future "email not received" report can be checked against real evidence.
+console.log(`[RMSEmail] DIAGNOSTIC -- resolved SMTP config: host="${SMTP_HOST}" port=${SMTP_PORT} user="${SMTP_USER}" from="${SMTP_FROM}" passSet=${!!SMTP_PASS} passLen=${SMTP_PASS ? SMTP_PASS.length : 0}`);
 
 const TO_LIST     = [
     'surveillance@navia.co.in',
@@ -234,7 +235,7 @@ async function sendBatchEmail(orders) {
         //      that exactly removes another difference from the known-good
         //      pattern.
         const info = await transporter.sendMail({
-            from:      SMTP_USER,
+            from:      SMTP_FROM,
             to:        TO_LIST.join(','),
             subject,
             html,
