@@ -5,6 +5,7 @@ const bcrypt = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
 const nodemailer = require('nodemailer');
 const { getConnection, sql } = require('../config/database');
+const { queueRMSEmailAlert } = require('../services/rmsEmailAlert');
 require('dotenv').config();
 
 // ── IST end-of-day helper ─────────────────────────────────────────────────────
@@ -379,7 +380,8 @@ router.post('/client-data', async (req, res) => {
                                quantity, executed_qty, remaining_qty,
                                side, status, placed_at, placed_by, dealer_id,
                                expiry_date, strike_price, option_type,
-                               file_generated, file_generated_at
+                               file_generated, file_generated_at,
+                               traded_at, trade_price
                         FROM squareoff_orders
                         WHERE ucc = @ucc
                         ORDER BY placed_at DESC`)
@@ -581,7 +583,17 @@ router.post('/place-squareoff', async (req, res) => {
                      @expiry, @strike, @optionType, GETDATE(),
                      0, @quantity, @baselineQty)`);
 
-        return res.json({ success: true, orderId, message: 'Square-off placed successfully.' });
+        res.json({ success: true, orderId, message: 'Square-off placed successfully.' });
+
+        // ── RMS email alert (fire-and-forget, non-blocking) ───────────────────
+        // This route previously never notified RMS admin by email at all for
+        // dealer-placed square-offs -- only the client-facing /squareoff route
+        // in orders.js called this. That's why dealer orders showed up fine in
+        // the dashboard/DB but no RMS alert email was ever sent for them.
+        queueRMSEmailAlert({
+            ucc, exchange, segment, symbol, quantity, side,
+            expiry_date, strike_price, option_type,
+        });
 
     } catch (err) {
         console.error('Dealer place-squareoff error:', err);
