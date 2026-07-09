@@ -34,6 +34,27 @@ const SMTP_HOST   = process.env.SMTP_HOST     || 'smtp.zatpatmail.com';
 const SMTP_PORT   = 465;
 const SMTP_USER   = process.env.SMTP_USER     || 'updates@navia.co.in';
 const SMTP_PASS   = process.env.SMTP_PASSWORD;
+
+// DIAGNOSTIC (2026-07-09): the ZatpatMail dashboard shows sync_dropcopy.py's
+// alert emails as captured/delivered, but this RMS alert's sends are NOT
+// captured there at all -- even though our own logs show the SMTP session
+// completing with "250 Message received". That combination means the RMS
+// alert is very likely not actually reaching ZatpatMail's real relay at
+// all, despite looking successful from inside this process. The one real
+// difference from sync_dropcopy.py (which hardcodes its SMTP_HOST/SMTP_USER
+// as plain Python string literals) is that this file reads them from
+// process.env first, falling back to the zatpatmail default only if unset.
+// If some environment variable named SMTP_HOST or SMTP_USER is set in this
+// process's environment to anything other than the intended values (a
+// leftover from another integration, a typo, a stale .env entry, etc.),
+// this code would silently connect to a completely different mail server
+// while still reporting success -- some relays/catch-alls accept and
+// silently drop mail. Logging the ACTUALLY RESOLVED values once at startup
+// (never the password itself, just whether it's set and its length) proves
+// or rules this out with real evidence instead of guessing further.
+// Remove this log once SMTP_HOST/SMTP_USER are confirmed correct.
+console.log(`[RMSEmail] DIAGNOSTIC -- resolved SMTP config: host="${SMTP_HOST}" port=${SMTP_PORT} user="${SMTP_USER}" passSet=${!!SMTP_PASS} passLen=${SMTP_PASS ? SMTP_PASS.length : 0}`);
+
 const TO_LIST     = [
     'surveillance@navia.co.in',
     'technology@navia.co.in',
@@ -150,10 +171,48 @@ async function sendBatchEmail(orders) {
     </div>`;
 
     try {
+        // FIX (2026-07-09, v8): removed `tls: { rejectUnauthorized: false }`.
+        // sync_dropcopy.py's smtplib.SMTP_SSL() call uses Python's DEFAULT SSL
+        // context, which performs full certificate verification -- and it has
+        // been delivering reliably. This code was explicitly disabling that
+        // same verification. That is the one remaining real asymmetry between
+        // the two code paths after content, headers, and Message-ID have all
+        // been matched and still didn't fix delivery.
+        // Why this matters: Node.js does NOT consult the Windows OS
+        // certificate store by default (it ships its own bundled root CA
+        // list) -- Python on Windows DOES read the OS store via
+        // ssl.create_default_context(). If this server sits behind any
+        // corporate network device that transparently inspects outbound TLS
+        // (a security gateway, antivirus mail/web shield, DLP appliance --
+        // common on corporate networks and totally invisible from inside the
+        // app), and IT has installed that device's root certificate into
+        // Windows' trust store, Python would silently trust it and pass
+        // through untouched -- while Node would see an untrusted certificate
+        // and throw, UNLESS verification was disabled, which is exactly what
+        // `rejectUnauthorized:false` does. That would make Node's SMTP
+        // session succeed against the inspecting device rather than
+        // necessarily reaching ZatpatMail's real servers -- some such devices
+        // complete the SMTP handshake themselves and apply their own content
+        // rules (financial/trading-related text is a common DLP trigger)
+        // before ever relaying onward, which fits everything observed: our
+        // own logs show "250 accepted", yet ZatpatMail's own dashboard never
+        // captures the message at all.
+        // Removing the override restores full verification, matching
+        // sync_dropcopy.py exactly. Two possible outcomes after deploying:
+        //   (a) Sending still succeeds exactly as before -- rules this out,
+        //       the certificate chain is fine, look elsewhere.
+        //   (b) Sending now FAILS with a certificate error in the logs
+        //       (look for e.code like UNABLE_TO_VERIFY_LEAF_SIGNATURE,
+        //       SELF_SIGNED_CERT_IN_CHAIN, or CERT_HAS_EXPIRED) -- that
+        //       PROVES a TLS-inspecting device sits on this path, which is
+        //       the real root cause and needs your network/security team
+        //       (allowlist this server's outbound 465 traffic, or add the
+        //       inspecting device's root CA to this server via the
+        //       NODE_EXTRA_CA_CERTS environment variable instead of
+        //       disabling verification).
         const transporter = nodemailer.createTransport({
             host: SMTP_HOST, port: SMTP_PORT, secure: true,
             auth: { user: SMTP_USER, pass: SMTP_PASS },
-            tls:  { rejectUnauthorized: false },
         });
         // FIX (2026-07-09): after a week of non-delivery even with the link
         // and admin-panel URL removed entirely (v5), the remaining problem is
@@ -195,7 +254,11 @@ async function sendBatchEmail(orders) {
             console.error(`[RMSEmail] WARNING -- relay rejected some recipients: ${JSON.stringify(info.rejected)}`);
         }
     } catch (e) {
+        // v8: log e.code/e.command too -- for TLS failures these carry the
+        // exact OpenSSL/Node TLS error name (e.g. UNABLE_TO_VERIFY_LEAF_SIGNATURE),
+        // which is the single most useful piece of evidence for this investigation.
         console.error('[RMSEmail] Send failed:', e.message);
+        console.error(`[RMSEmail] Error code: ${e.code || 'n/a'} | command: ${e.command || 'n/a'}`);
     }
 }
 
