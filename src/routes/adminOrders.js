@@ -46,7 +46,7 @@ function makeNeatCMRow(serial, side, symbol, qty, ucc, memberCode) {
 // Previously a hardcoded map - which is exactly how NIFTY's lot size silently
 // went stale (75 instead of the correct, current 65) until proven against real
 // orders and the lot_size_master table. Now reads the live table instead, the
-// same one the Python DropCopy sync service already keeps up to date via
+// same one the Python DropCopy sync service keeps up to date via
 // /api/dropcopy/refresh-lots after every successful sync - so this can't
 // drift out of sync again for any symbol, not just NIFTY.
 // lotSizeMap is built once per request from lot_size_master (see /orders/
@@ -317,15 +317,47 @@ router.get('/orders', adminAuthenticate, async (req, res) => {
     try {
         const pool = await getConnection();
         let query = `
-            SELECT 
+            SELECT
                 o.order_id, o.ucc, c.client_name, o.exchange, o.segment,
                 o.symbol, o.side, o.quantity, o.order_type, o.status,
                 o.placed_at, o.traded_at, o.trade_price,
                 o.placed_by, o.dealer_id, o.expiry_date,
                 o.strike_price, o.option_type,
-                o.file_generated, o.file_generated_at, o.alert_sent
+                o.file_generated, o.file_generated_at, o.alert_sent,
+                -- Stale-order flag: this order is still ORDER_RECEIVED, but the
+                -- position it targeted is already flat (net_qty = 0) -- meaning
+                -- the client's exposure closed some other way (own trading app,
+                -- a duplicate/test order, etc) before RMS ever processed THIS
+                -- order. Downloading/submitting a file for a stale order would
+                -- send a square-off request to the exchange for a position that
+                -- no longer has any real exposure. CM/equity is checked against
+                -- today's day_positions row (same join already proven in the
+                -- BSE scrip-code lookup below); FO is checked against the live
+                -- positions table (the same source the Net position tab itself
+                -- uses to decide whether Square off is even offered).
+                CASE
+                    WHEN o.status <> 'ORDER_RECEIVED' THEN 0
+                    WHEN o.segment = 'CM' AND dp.net_qty = 0 THEN 1
+                    WHEN o.segment = 'FO' AND p.net_qty  = 0 THEN 1
+                    ELSE 0
+                END AS is_stale
             FROM squareoff_orders o
             LEFT JOIN clients c ON o.ucc = c.ucc
+            LEFT JOIN day_positions dp
+                ON dp.ucc      = o.ucc
+                AND dp.symbol   = o.symbol
+                AND dp.exchange = o.exchange
+                AND dp.segment  = o.segment
+                AND dp.instrument_type = 'EQUITY'
+                AND dp.trade_date = CAST(GETDATE() AS DATE)
+            LEFT JOIN positions p
+                ON p.ucc      = o.ucc
+                AND p.symbol   = o.symbol
+                AND p.exchange = o.exchange
+                AND p.segment  = o.segment
+                AND (p.expiry_date = o.expiry_date OR (p.expiry_date IS NULL AND o.expiry_date IS NULL))
+                AND (ABS(ISNULL(p.strike_price,0) - ISNULL(o.strike_price,0)) < 0.01)
+                AND (p.option_type = o.option_type OR (p.option_type IS NULL AND o.option_type IS NULL))
             WHERE 1=1
         `;
         const request = pool.request();
@@ -375,7 +407,7 @@ router.post('/orders/mark-file-generated', adminAuthenticate, async (req, res) =
         const pool   = await getConnection();
         const idList = order_ids.map(id => `'${id}'`).join(',');
         await pool.request().query(`
-            UPDATE squareoff_orders 
+            UPDATE squareoff_orders
             SET file_generated = 1, file_generated_at = GETDATE(), status = 'FILE_GENERATED'
             WHERE order_id IN (${idList}) AND status = 'ORDER_RECEIVED'
         `);
@@ -642,7 +674,7 @@ router.post('/orders/generate-file', adminAuthenticate, async (req, res) => {
 
         // Mark orders as file generated
         await pool.request().query(`
-            UPDATE squareoff_orders 
+            UPDATE squareoff_orders
             SET file_generated = 1, file_generated_at = GETDATE(), status = 'FILE_GENERATED'
             WHERE order_id IN (${idList}) AND status = 'ORDER_RECEIVED'
         `);
@@ -697,7 +729,7 @@ router.get('/orders/stats', adminAuthenticate, async (req, res) => {
     try {
         const pool = await getConnection();
         const result = await pool.request().query(`
-            SELECT 
+            SELECT
                 COUNT(*) as total,
                 SUM(CASE WHEN status = 'ORDER_RECEIVED' THEN 1 ELSE 0 END) as received,
                 SUM(CASE WHEN status = 'FILE_GENERATED' THEN 1 ELSE 0 END) as file_generated,
