@@ -1,11 +1,11 @@
 {
   "files": {
-    "main.js": "/static/js/main.516bf059.js",
+    "main.js": "/static/js/main.4057790d.js",
     "static/media/navia-logo.png": "/static/media/navia-logo.3518c6bdcb2e958d5870.png",
     "index.html": "/index.html",
-    "main.516bf059.js.map": "/static/js/main.516bf059.js.map"
+    "main.4057790d.js.map": "/static/js/main.4057790d.js.map"
   },
   "entrypoints": [
-    "static/js/main.516bf059.js"
+    "static/js/main.4057790d.js"
   ]
 }
