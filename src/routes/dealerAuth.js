@@ -376,15 +376,45 @@ router.post('/client-data', async (req, res) => {
                 // render here, regardless of actual order status. That's why the
                 // dealer view showed "No open position" for orders the client view
                 // correctly showed as Traded.
-                .query(`SELECT order_id, ucc, exchange, segment, symbol,
-                               quantity, executed_qty, remaining_qty,
-                               side, status, placed_at, placed_by, dealer_id,
-                               expiry_date, strike_price, option_type,
-                               file_generated, file_generated_at,
-                               traded_at, trade_price
-                        FROM squareoff_orders
-                        WHERE ucc = @ucc
-                        ORDER BY placed_at DESC`)
+                //
+                // FIX: scoped to TODAY only (CAST(o.placed_at AS DATE) = today) --
+                // this list was previously the client's ENTIRE order history, which
+                // made the "My orders"/"Orders" tab grow unbounded and unreadable
+                // over time. Same is_stale computation as adminOrders.js's /orders
+                // route (day_positions for CM, positions for FO) so the dealer sees
+                // the same "target position already closed" warning the RMS admin
+                // now sees, instead of just a bare, unexplained "Order received".
+                .query(`SELECT o.order_id, o.ucc, o.exchange, o.segment, o.symbol,
+                               o.quantity, o.executed_qty, o.remaining_qty,
+                               o.side, o.status, o.placed_at, o.placed_by, o.dealer_id,
+                               o.expiry_date, o.strike_price, o.option_type,
+                               o.file_generated, o.file_generated_at,
+                               o.traded_at, o.trade_price,
+                               CASE
+                                   WHEN o.status <> 'ORDER_RECEIVED' THEN 0
+                                   WHEN o.segment = 'CM' AND dp.net_qty = 0 THEN 1
+                                   WHEN o.segment = 'FO' AND p.net_qty  = 0 THEN 1
+                                   ELSE 0
+                               END AS is_stale
+                        FROM squareoff_orders o
+                        LEFT JOIN day_positions dp
+                            ON dp.ucc      = o.ucc
+                            AND dp.symbol   = o.symbol
+                            AND dp.exchange = o.exchange
+                            AND dp.segment  = o.segment
+                            AND dp.instrument_type = 'EQUITY'
+                            AND dp.trade_date = CAST(GETDATE() AS DATE)
+                        LEFT JOIN positions p
+                            ON p.ucc      = o.ucc
+                            AND p.symbol   = o.symbol
+                            AND p.exchange = o.exchange
+                            AND p.segment  = o.segment
+                            AND (p.expiry_date = o.expiry_date OR (p.expiry_date IS NULL AND o.expiry_date IS NULL))
+                            AND (ABS(ISNULL(p.strike_price,0) - ISNULL(o.strike_price,0)) < 0.01)
+                            AND (p.option_type = o.option_type OR (p.option_type IS NULL AND o.option_type IS NULL))
+                        WHERE o.ucc = @ucc
+                        AND CAST(o.placed_at AS DATE) = CAST(GETDATE() AS DATE)
+                        ORDER BY o.placed_at DESC`)
                 .catch(() => ({ recordset: [] })),
             pool.request()
                 .input('ucc', sql.VarChar(20), ucc.trim())

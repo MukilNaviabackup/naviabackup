@@ -213,16 +213,50 @@ router.get('/my-orders', authenticate, async (req, res) => {
         const pool   = await getConnection();
         const result = await pool.request()
             .input('ucc', sql.VarChar, ucc)
+            // FIX: scoped to TODAY only (CAST(o.placed_at AS DATE) = today) --
+            // this list was previously the client's ENTIRE order history, which
+            // made My Orders grow unbounded and unreadable over time.
+            //
+            // is_stale: flags an order still sitting at ORDER_RECEIVED whose
+            // target position has ALREADY gone flat (net_qty = 0) via some
+            // other route -- e.g. the client squared off the same position
+            // from their own live trading app instead of via Navia Backup.
+            // Same computation already deployed on the admin Sq-Off Orders
+            // table (adminOrders.js) and the dealer Orders tab (orders.js's
+            // sibling dealerAuth.js /client-data route) -- day_positions for
+            // CM/equity, positions for FO, matched the same way in both.
             .query(`SELECT
-                        order_id, ucc, exchange, segment, symbol,
-                        quantity, executed_qty, side, order_type, status,
-                        placed_at, traded_at, trade_price,
-                        placed_by, dealer_id,
-                        expiry_date, strike_price, option_type,
-                        file_generated, file_generated_at
-                    FROM squareoff_orders
-                    WHERE ucc = @ucc
-                    ORDER BY placed_at DESC`);
+                        o.order_id, o.ucc, o.exchange, o.segment, o.symbol,
+                        o.quantity, o.executed_qty, o.side, o.order_type, o.status,
+                        o.placed_at, o.traded_at, o.trade_price,
+                        o.placed_by, o.dealer_id,
+                        o.expiry_date, o.strike_price, o.option_type,
+                        o.file_generated, o.file_generated_at,
+                        CASE
+                            WHEN o.status <> 'ORDER_RECEIVED' THEN 0
+                            WHEN o.segment = 'CM' AND dp.net_qty = 0 THEN 1
+                            WHEN o.segment = 'FO' AND p.net_qty  = 0 THEN 1
+                            ELSE 0
+                        END AS is_stale
+                    FROM squareoff_orders o
+                    LEFT JOIN day_positions dp
+                        ON dp.ucc      = o.ucc
+                        AND dp.symbol   = o.symbol
+                        AND dp.exchange = o.exchange
+                        AND dp.segment  = o.segment
+                        AND dp.instrument_type = 'EQUITY'
+                        AND dp.trade_date = CAST(GETDATE() AS DATE)
+                    LEFT JOIN positions p
+                        ON p.ucc      = o.ucc
+                        AND p.symbol   = o.symbol
+                        AND p.exchange = o.exchange
+                        AND p.segment  = o.segment
+                        AND (p.expiry_date = o.expiry_date OR (p.expiry_date IS NULL AND o.expiry_date IS NULL))
+                        AND (ABS(ISNULL(p.strike_price,0) - ISNULL(o.strike_price,0)) < 0.01)
+                        AND (p.option_type = o.option_type OR (p.option_type IS NULL AND o.option_type IS NULL))
+                    WHERE o.ucc = @ucc
+                    AND CAST(o.placed_at AS DATE) = CAST(GETDATE() AS DATE)
+                    ORDER BY o.placed_at DESC`);
         return res.json({ success: true, orders: result.recordset });
     } catch (err) {
         return res.status(500).json({ error: 'Could not fetch orders.' });
