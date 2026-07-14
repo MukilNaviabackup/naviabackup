@@ -53,6 +53,28 @@ function buildTradingSymbol(order) {
     return `${sym}${exp}FUT`;
 }
 
+// Spaced version of the trading symbol, used ONLY in the email subject line
+// (per explicit request) -- e.g. "SENSEX 16 JUL 26 81000 CE" instead of
+// "SENSEX16JUL81000CE". Does not touch buildTradingSymbol() itself, which
+// stays exactly as-is for the body table and the WhatsApp template param.
+function buildTradingSymbolSpaced(order) {
+    const sym = (order.symbol || '').toUpperCase().trim();
+    const seg = (order.segment || '').toUpperCase();
+    if (seg === 'CM') return sym;
+
+    const d   = order.expiry_date ? new Date(order.expiry_date) : null;
+    const dd  = d ? String(d.getUTCDate()).padStart(2, '0') : '';
+    const mmm = d ? MONTHS[d.getUTCMonth()] : '';
+    const yy  = d ? String(d.getUTCFullYear()).slice(-2) : '';
+    const expSpaced = [dd, mmm, yy].filter(Boolean).join(' ');
+
+    if (order.option_type && order.option_type !== 'XX') {
+        const strike = order.strike_price ? Math.round(Number(order.strike_price)) : '';
+        return [sym, expSpaced, strike, order.option_type].filter(Boolean).join(' ');
+    }
+    return [sym, expSpaced, 'FUT'].filter(Boolean).join(' ');
+}
+
 function getSegmentLabel(segment, optionType) {
     const seg = (segment || '').toUpperCase();
     if (seg === 'CM') return 'EQ';
@@ -61,9 +83,15 @@ function getSegmentLabel(segment, optionType) {
 }
 
 function fmtDate(d) {
+    // FIX: explicit timeZone -- without this, toLocaleString falls back to the
+    // server process's own timezone (Azure App Service Linux runs in UTC),
+    // so the "Time" row in the trade-confirmation email showed the trade
+    // timestamp 5.5 hours behind actual IST, even though the en-IN locale
+    // made the date/month layout look correct at a glance.
     return new Date(d).toLocaleString('en-IN', {
         day: '2-digit', month: 'short', year: 'numeric',
-        hour: '2-digit', minute: '2-digit'
+        hour: '2-digit', minute: '2-digit',
+        timeZone: 'Asia/Kolkata'
     });
 }
 
@@ -75,7 +103,8 @@ function buildNotificationContext(order, client, statusLabel) {
         exchange:        order.exchange,
         segmentLabel:    getSegmentLabel(order.segment, order.option_type),
         instrumentType:  getInstrumentLabel(order.segment, order.option_type),
-        tradingSymbol:   buildTradingSymbol(order),
+        tradingSymbol:       buildTradingSymbol(order),
+        tradingSymbolSpaced: buildTradingSymbolSpaced(order),
         side:            (order.side || '').toUpperCase(),
         executedQty:     order.executed_qty,
         requestedQty:    order.quantity,
@@ -111,21 +140,29 @@ async function sendTradeEmail(client, order, statusLabel) {
           Your square-off order has been <strong style="color:${statusColor}">${ctx.statusLabel}</strong> on
           <strong>${ctx.exchange}</strong>. Details below:
         </p>
-        <table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:18px">
-          <tr><td style="padding:8px 0;color:#64748b;width:45%">Exchange</td><td style="padding:8px 0;color:#0f172a;font-weight:600">${ctx.exchange}</td></tr>
-          <tr style="background:#f8fafc"><td style="padding:8px 10px;color:#64748b">Segment</td><td style="padding:8px 10px;color:#0f172a;font-weight:600">${ctx.segmentLabel}</td></tr>
-          <tr><td style="padding:8px 0;color:#64748b">Trading Symbol</td><td style="padding:8px 0;color:#0f172a;font-weight:600">${ctx.tradingSymbol}</td></tr>
-          <tr style="background:#f8fafc"><td style="padding:8px 10px;color:#64748b">Instrument Type</td><td style="padding:8px 10px;color:#0f172a;font-weight:600">${ctx.instrumentType}</td></tr>
-          <tr><td style="padding:8px 0;color:#64748b">Side</td><td style="padding:8px 0;color:#0f172a;font-weight:600">${ctx.side}</td></tr>
-          <tr style="background:#f8fafc"><td style="padding:8px 10px;color:#64748b">Quantity Traded</td><td style="padding:8px 10px;color:#0f172a;font-weight:600">${ctx.executedQty} / ${ctx.requestedQty}</td></tr>
-          <tr><td style="padding:8px 0;color:#64748b">Status</td><td style="padding:8px 0">
-            <span style="background:${statusBg};color:${statusColor};padding:3px 10px;border-radius:12px;font-weight:600;font-size:12px">${ctx.statusLabel}</span>
-          </td></tr>
-          <tr style="background:#f8fafc"><td style="padding:8px 10px;color:#64748b">Time</td><td style="padding:8px 10px;color:#0f172a;font-weight:600">${ctx.tradedAt}</td></tr>
+        <table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:18px;border:1px solid #cbd5e1">
+          <tr style="background:#f8fafc">
+            <th style="padding:8px;border:1px solid #cbd5e1;color:#0f172a;text-align:left">Segment</th>
+            <th style="padding:8px;border:1px solid #cbd5e1;color:#0f172a;text-align:left">Trading Symbol</th>
+            <th style="padding:8px;border:1px solid #cbd5e1;color:#0f172a;text-align:left">Side</th>
+            <th style="padding:8px;border:1px solid #cbd5e1;color:#0f172a;text-align:left">Traded Quantity</th>
+            <th style="padding:8px;border:1px solid #cbd5e1;color:#0f172a;text-align:left">Order Status</th>
+            <th style="padding:8px;border:1px solid #cbd5e1;color:#0f172a;text-align:left">Trade Price</th>
+          </tr>
+          <tr>
+            <td style="padding:8px;border:1px solid #cbd5e1;color:#0f172a">${ctx.segmentLabel}</td>
+            <td style="padding:8px;border:1px solid #cbd5e1;color:#0f172a">${ctx.tradingSymbol}</td>
+            <td style="padding:8px;border:1px solid #cbd5e1;color:#0f172a">${ctx.side}</td>
+            <td style="padding:8px;border:1px solid #cbd5e1;color:#0f172a">${ctx.executedQty} / ${ctx.requestedQty}</td>
+            <td style="padding:8px;border:1px solid #cbd5e1">
+              <span style="background:${statusBg};color:${statusColor};padding:3px 10px;border-radius:12px;font-weight:600;font-size:12px">${ctx.statusLabel}</span>
+            </td>
+            <td style="padding:8px;border:1px solid #cbd5e1;color:#0f172a">Rs.${ctx.tradePrice}</td>
+          </tr>
         </table>
         <p style="font-size:12px;color:#9BA3B0;line-height:1.6;margin:0">
           This is an automated confirmation from Navia Backup, the emergency square-off platform.
-          For any discrepancy, please contact your dealer or RMS desk immediately.
+          For any discrepancy, please <a href="https://support.navia.co.in/support/solutions/articles/1000321790-navia-backup-your-safety-net-during-trading-downtime" style="color:#1B4FD8;text-decoration:underline">raise a ticket</a>.
         </p>
       </div>
     </div>`;
@@ -135,7 +172,7 @@ async function sendTradeEmail(client, order, statusLabel) {
         await transporter.sendMail({
             from:    process.env.SMTP_FROM || 'updates@navia.co.in',
             to:      client.email,
-            subject: `Trade ${ctx.statusLabel} — ${ctx.tradingSymbol} (${ctx.exchange})`,
+            subject: `Navia Backup Trade Confirmation — ${ctx.tradingSymbolSpaced} (${ctx.exchange})`,
             html,
         });
         console.log(`[TradeNotify] Email sent to ${client.email} for order ${order.order_id}`);
