@@ -436,8 +436,19 @@ router.post('/client-data', async (req, res) => {
         let holdingsRes = { recordset: [] };
         try {
             const holdingsPromise = fetchHoldingsForUCC(ucc.trim());
+            // FIX (16-Jul-2026): was 8000ms here, shorter than the 15000ms the
+            // client-side holdings.js route allows the SAME Sharepro API call.
+            // Sharepro is measured taking 8-10s to respond under normal load
+            // (see [Perf] Slow: POST /client-data | 9926ms in production logs,
+            // same moment the client route's 15s-timeout call to Sharepro
+            // succeeded with 15 holdings) -- so this outer race was killing a
+            // holdings fetch that would have succeeded, well before Sharepro
+            // itself had a chance to respond. Bumped to 16000ms, matching (and
+            // just above) fetchHoldingsForUCC's own https timeout below so
+            // this outer race is a true safety net, not the thing that fires
+            // first in the normal "Sharepro is just a bit slow" case.
             const timeoutPromise  = new Promise(resolve =>
-                setTimeout(() => resolve({ recordset: [] }), 8000)
+                setTimeout(() => resolve({ recordset: [] }), 16000)
             );
             holdingsRes = await Promise.race([holdingsPromise, timeoutPromise]);
         } catch (he) {
@@ -684,7 +695,17 @@ async function fetchHoldingsForUCC(ucc) {
                 'Content-Type':   'application/json',
                 'Content-Length': Buffer.byteLength(body),
             },
-            timeout: 6000
+            // FIX (16-Jul-2026): was 6000ms -- 9 seconds shorter than the
+            // client-side holdings.js route's 15000ms timeout for the exact
+            // same Sharepro endpoint/UCC. Root-caused live via production
+            // logs: "[Holdings] Fetched 15 holdings for 88707169" (client
+            // route, 15s timeout, succeeded) followed 350ms later by
+            // "[Holdings-Dealer] Timeout" / "socket hang up" (this route, 6s
+            // timeout, killed mid-flight) for the SAME UCC in the SAME
+            // second -- Sharepro was simply taking 8-10s to respond, well
+            // within the client route's budget but past this one's. Matched
+            // to 15000ms so both routes give Sharepro the same amount of time.
+            timeout: 15000
         };
 
         const req = https_mod.request(options, (res) => {
