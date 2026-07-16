@@ -366,24 +366,82 @@ router.get('/sync-logs', async (req, res) => {
         return res.status(401).json({ error: 'Unauthorized.' });
     }
     try {
-        const pool    = await getConnection();
-        const request = pool.request();
-        let query = `
-            SELECT TOP 200
+        const pool = await getConnection();
+
+        // FIX (16-Jul-2026): this route used to be a flat "SELECT TOP 200 ...
+        // ORDER BY log_time DESC" with no pagination, and the frontend derived
+        // its Total/Success/Error counts from that same capped 200-row array.
+        // With 5 feeds syncing every 60-90s during trading hours, a single day
+        // blows past 200 rows well before market close -- so the table silently
+        // dropped all earlier-in-the-day rows (confirmed: 16-Jul-2026's log
+        // page bottomed out at 14:56 despite trading having started at 9:00),
+        // and "Total: 200 / Success: 200" was really just "however many of the
+        // 200 returned rows happened to be Success", not the day's real totals.
+        // Now paginated with OFFSET/FETCH, and a separate un-paginated COUNT
+        // query (same filters) supplies real full-range totals independent of
+        // page size.
+        const page   = parseInt(req.query.page)  || 1;
+        const limit  = parseInt(req.query.limit) || 200;
+        const offset = (page - 1) * limit;
+
+        // Build the WHERE filters once, reused identically by both queries
+        // below so the summary counts always match what the page is filtered to.
+        const filters = [];
+        if (req.query.date_from) filters.push({ clause: ' AND CAST(log_time AS DATE) >= @dateFrom', name: 'dateFrom', type: sql.Date,        val: req.query.date_from });
+        if (req.query.date_to)   filters.push({ clause: ' AND CAST(log_time AS DATE) <= @dateTo',   name: 'dateTo',   type: sql.Date,        val: req.query.date_to   });
+        if (req.query.exchange && req.query.exchange !== 'ALL') filters.push({ clause: ' AND exchange = @exchange', name: 'exchange', type: sql.VarChar(10), val: req.query.exchange });
+        if (req.query.status   && req.query.status   !== 'ALL') filters.push({ clause: ' AND status = @status',    name: 'status',   type: sql.VarChar(20), val: req.query.status   });
+        const whereClause = ' WHERE 1=1' + filters.map(f => f.clause).join('');
+
+        // ── Paginated rows for the table ───────────────────────────────────
+        const rowsReq = pool.request();
+        filters.forEach(f => rowsReq.input(f.name, f.type, f.val));
+        rowsReq.input('offset', sql.Int, offset);
+        rowsReq.input('limit',  sql.Int, limit);
+        const rowsResult = await rowsReq.query(`
+            SELECT
                 id, log_time, file_source, exchange, segment,
                 status, trades_count, positions_count,
                 sync_duration_ms, error_message, file_size_bytes, trade_date,
                 source_host
             FROM sync_logs
-            WHERE 1=1
-        `;
-        if (req.query.date_from) { query += ' AND CAST(log_time AS DATE) >= @dateFrom'; request.input('dateFrom', sql.Date, req.query.date_from); }
-        if (req.query.date_to)   { query += ' AND CAST(log_time AS DATE) <= @dateTo';   request.input('dateTo',   sql.Date, req.query.date_to);   }
-        if (req.query.exchange && req.query.exchange !== 'ALL') { query += ' AND exchange = @exchange'; request.input('exchange', sql.VarChar(10), req.query.exchange); }
-        if (req.query.status   && req.query.status   !== 'ALL') { query += ' AND status = @status';    request.input('status',   sql.VarChar(20), req.query.status);   }
-        query += ' ORDER BY log_time DESC';
-        const result = await request.query(query);
-        return res.json({ success: true, logs: result.recordset });
+            ${whereClause}
+            ORDER BY log_time DESC
+            OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY
+        `);
+
+        // ── True totals across the WHOLE filtered range, not just this page ─
+        const countReq = pool.request();
+        filters.forEach(f => countReq.input(f.name, f.type, f.val));
+        const countResult = await countReq.query(`
+            SELECT
+                COUNT(*)                                             AS total,
+                SUM(CASE WHEN status = 'SUCCESS' THEN 1 ELSE 0 END)  AS success_count,
+                SUM(CASE WHEN status = 'WARNING' THEN 1 ELSE 0 END)  AS warning_count,
+                SUM(CASE WHEN status = 'ERROR'   THEN 1 ELSE 0 END)  AS error_count
+            FROM sync_logs
+            ${whereClause}
+        `);
+        const counts = countResult.recordset[0] || {};
+        const total  = counts.total || 0;
+
+        return res.json({
+            success: true,
+            logs:    rowsResult.recordset,
+            summary: {
+                total,
+                success_count: counts.success_count || 0,
+                warning_count: counts.warning_count || 0,
+                error_count:   counts.error_count   || 0,
+            },
+            pagination: {
+                page,
+                limit,
+                total,
+                total_pages: Math.max(1, Math.ceil(total / limit)),
+                has_next:    page * limit < total,
+            }
+        });
     } catch (err) {
         return res.status(500).json({ error: err.message });
     }
