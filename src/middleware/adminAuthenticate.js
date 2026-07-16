@@ -28,4 +28,17 @@ function requireFullAdmin(req, res, next) {
     next();
 }
 
-module.exports = { adminAuthenticate, requireFullAdmin };
+// Dealer Admin (support-desk role, 14-Jul-2026): this role must never be able
+// to generate or download the RMS square-off basket file, even by calling the
+// API directly instead of going through the (also-hidden) UI button. Applied
+// to POST /orders/generate-file and POST /orders/mark-file-generated in
+// adminOrders.js. Deliberately does NOT block ADMIN or SUBUSER -- both keep
+// their existing, unchanged file-generation access.
+function blockDealerAdmin(req, res, next) {
+    if (req.admin.role === 'DEALER_ADMIN') {
+        return res.status(403).json({ error: 'File generation and download is not available for this role.' });
+    }
+    next();
+}
+
+module.exports = { adminAuthenticate, requireFullAdmin, blockDealerAdmin };

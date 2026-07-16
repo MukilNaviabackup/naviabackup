@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { getConnection, sql } = require('../config/database');
-const { adminAuthenticate } = require('../middleware/adminAuthenticate');
+const { adminAuthenticate, blockDealerAdmin } = require('../middleware/adminAuthenticate');
 const nodemailer = require('nodemailer');
 require('dotenv').config();
 
@@ -400,7 +400,7 @@ router.post('/orders/update-status', adminAuthenticate, async (req, res) => {
 });
 
 // Mark file as generated for selected orders
-router.post('/orders/mark-file-generated', adminAuthenticate, async (req, res) => {
+router.post('/orders/mark-file-generated', adminAuthenticate, blockDealerAdmin, async (req, res) => {
     const { order_ids } = req.body;
     if (!order_ids || !order_ids.length) return res.status(400).json({ error: 'No orders selected.' });
     try {
@@ -418,7 +418,7 @@ router.post('/orders/mark-file-generated', adminAuthenticate, async (req, res) =
 });
 
 // Generate exchange basket file for selected orders
-router.post('/orders/generate-file', adminAuthenticate, async (req, res) => {
+router.post('/orders/generate-file', adminAuthenticate, blockDealerAdmin, async (req, res) => {
     const { order_ids, exchange } = req.body;
     if (!order_ids || !order_ids.length) return res.status(400).json({ error: 'No orders selected.' });
     try {
