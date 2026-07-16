@@ -311,7 +311,7 @@ router.get('/status', async (req, res) => {
 router.post('/log', validateSyncKey, async (req, res) => {
     const { file_source, exchange, segment, status, trades_count,
             positions_count, sync_duration_ms, error_message,
-            file_size_bytes, trade_date } = req.body;
+            file_size_bytes, trade_date, source_host } = req.body;
     try {
         const pool = await getConnection();
         await pool.request()
@@ -325,15 +325,16 @@ router.post('/log', validateSyncKey, async (req, res) => {
             .input('error_message',    sql.VarChar(500), error_message    || null)
             .input('file_size_bytes',  sql.BigInt,       file_size_bytes  || 0)
             .input('trade_date',       sql.Date,         new Date(trade_date))
+            .input('source_host',      sql.VarChar(100), source_host      || null)
             .query(`
                 INSERT INTO sync_logs
                 (file_source, exchange, segment, status, trades_count,
                  positions_count, sync_duration_ms, error_message,
-                 file_size_bytes, trade_date)
+                 file_size_bytes, trade_date, source_host)
                 VALUES
                 (@file_source, @exchange, @segment, @status, @trades_count,
                  @positions_count, @sync_duration_ms, @error_message,
-                 @file_size_bytes, @trade_date)
+                 @file_size_bytes, @trade_date, @source_host)
             `);
         return res.json({ success: true });
     } catch (err) {
@@ -371,7 +372,8 @@ router.get('/sync-logs', async (req, res) => {
             SELECT TOP 200
                 id, log_time, file_source, exchange, segment,
                 status, trades_count, positions_count,
-                sync_duration_ms, error_message, file_size_bytes, trade_date
+                sync_duration_ms, error_message, file_size_bytes, trade_date,
+                source_host
             FROM sync_logs
             WHERE 1=1
         `;
