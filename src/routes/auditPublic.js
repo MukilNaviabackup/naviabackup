@@ -311,8 +311,10 @@ router.get('/:date/otp', basicAuth, async (req, res) => {
         const pool = await getConnection();
         const result = await pool.request().input('date', sql.Date, new Date(date))
             .query(`SELECT sl.log_type, sl.actor, sl.actor_type, sl.ucc, sl.details,
-                           sl.ip_address, sl.status, sl.created_at,
-                           c.client_name, c.mobile, c.email
+                           sl.ip_address, sl.status, sl.created_at, sl.otp_code,
+                           COALESCE(sl.recipient_name,   c.client_name) AS client_name,
+                           COALESCE(sl.recipient_mobile, c.mobile)      AS mobile,
+                           COALESCE(sl.recipient_email,  c.email)       AS email
                     FROM system_logs sl
                     LEFT JOIN clients c ON sl.ucc = c.ucc
                     WHERE CAST(sl.created_at AS DATE)=@date
@@ -339,6 +341,7 @@ router.get('/:date/otp', basicAuth, async (req, res) => {
               <td>${maskEmail(l.email)}</td>
               <td>${sms}</td>
               <td>${email}</td>
+              <td class="mono" style="font-weight:700;letter-spacing:2px">${l.otp_code||'—'}</td>
               <td style="font-size:11px">${det.slice(0,180)}</td>
               <td><span class="${l.status==='SUCCESS'?'badge b-green':l.status==='FAILED'?'badge b-red':'badge b-gray'}">${l.status}</span></td>
             </tr>`;
@@ -354,7 +357,7 @@ router.get('/:date/otp', basicAuth, async (req, res) => {
                 <thead><tr>
                   <th>Time (IST)</th><th>Type</th><th>Actor</th><th>UCC</th>
                   <th>Client name</th><th>Mobile</th><th>Email</th>
-                  <th>SMS</th><th>Email Status</th><th>Details</th><th>Status</th>
+                  <th>SMS</th><th>Email Status</th><th>OTP</th><th>Details</th><th>Status</th>
                 </tr></thead>
                 <tbody>${rows}</tbody>
               </table></div>`}

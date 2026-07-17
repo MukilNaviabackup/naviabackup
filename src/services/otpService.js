@@ -218,8 +218,14 @@ async function generateAndSendOTP(clientId, mobile, email, clientName, ucc) {
                     .input('ip',        sql.VarChar(50),   null)
                     .input('details',   sql.NVarChar(500), `SMS:${smsSent} | Email:${emailSent} | Mobile:${mobile}`)
                     .input('status',    sql.VarChar(20),   (smsSent || emailSent) ? 'SUCCESS' : 'FAILED')
-                    .query(`INSERT INTO system_logs (log_type,actor,actor_type,ucc,ip_address,details,status,created_at)
-                            VALUES (@logType,@actor,@actorType,@ucc,@ip,@details,@status,GETDATE())`);
+                    .input('recName',   sql.VarChar(150),  clientName || null)
+                    .input('recMobile', sql.VarChar(20),   mobile || null)
+                    .input('recEmail',  sql.VarChar(150),  email || null)
+                    .input('otpCode',   sql.VarChar(6),    otp || null)
+                    .query(`INSERT INTO system_logs (log_type,actor,actor_type,ucc,ip_address,details,status,
+                                recipient_name,recipient_mobile,recipient_email,otp_code,created_at)
+                            VALUES (@logType,@actor,@actorType,@ucc,@ip,@details,@status,
+                                @recName,@recMobile,@recEmail,@otpCode,GETDATE())`);
             } catch(e) { console.error('[OTP] system_log write failed:', e.message); }
         });
     }).catch(err => {

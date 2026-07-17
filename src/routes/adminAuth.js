@@ -20,7 +20,7 @@ function getISTEndOfDay() {
 }
 
 /* ── Fire-and-forget system log writer ───────────────────────────────────────*/
-function writeLog(logType, actor, actorType, ucc, ip, details, status) {
+function writeLog(logType, actor, actorType, ucc, ip, details, status, recipientName, recipientMobile, recipientEmail, otpCode) {
     setImmediate(async () => {
         try {
             const pool = await getConnection();
@@ -32,8 +32,14 @@ function writeLog(logType, actor, actorType, ucc, ip, details, status) {
                 .input('ip',        sql.VarChar(50),   ip        || null)
                 .input('details',   sql.NVarChar(500), details   || null)
                 .input('status',    sql.VarChar(20),   status    || 'SUCCESS')
-                .query(`INSERT INTO system_logs (log_type,actor,actor_type,ucc,ip_address,details,status,created_at)
-                        VALUES (@logType,@actor,@actorType,@ucc,@ip,@details,@status,GETDATE())`);
+                .input('recName',   sql.VarChar(150),  recipientName   || null)
+                .input('recMobile', sql.VarChar(20),   recipientMobile || null)
+                .input('recEmail',  sql.VarChar(150),  recipientEmail  || null)
+                .input('otpCode',   sql.VarChar(6),    otpCode || null)
+                .query(`INSERT INTO system_logs (log_type,actor,actor_type,ucc,ip_address,details,status,
+                            recipient_name,recipient_mobile,recipient_email,otp_code,created_at)
+                        VALUES (@logType,@actor,@actorType,@ucc,@ip,@details,@status,
+                            @recName,@recMobile,@recEmail,@otpCode,GETDATE())`);
         } catch (err) {
             console.error('[SystemLog] admin write failed:', err.message);
         }
@@ -136,7 +142,10 @@ router.post('/login/initiate', async (req, res) => {
                         ORDER BY expires_at DESC`);
 
             if (existingSession.recordset.length > 0) {
-                writeLog('ADMIN_OTP_SENT', admin.full_name, 'ADMIN', null, ip, `OTP reused for ${admin.email}`, 'SUCCESS');
+                // No fresh OTP is generated on reuse -- the prior session's OTP
+                // hash isn't reversible, so there's nothing to log here.
+                writeLog('ADMIN_OTP_SENT', admin.full_name, 'ADMIN', null, ip, `OTP reused for ${admin.email}`, 'SUCCESS',
+                    admin.full_name, null, admin.email, null);
                 return res.json({
                     success: true,
                     sessionId: existingSession.recordset[0].session_id,
@@ -163,7 +172,8 @@ router.post('/login/initiate', async (req, res) => {
         const emailSent = await sendAdminOTPEmail(admin.email, admin.full_name, otp);
         writeLog('ADMIN_OTP_SENT', admin.full_name, 'ADMIN', null, ip,
             `OTP sent to ${admin.email} | Email:${emailSent}`,
-            emailSent ? 'SUCCESS' : 'FAILED');
+            emailSent ? 'SUCCESS' : 'FAILED',
+            admin.full_name, null, admin.email, otp);
         console.log(`Admin OTP for ${username}: ${otp}`);
 
         return res.json({ success: true, sessionId, email: admin.email.replace(/(.{2})(.*)(@.*)/, '$1***$3'), message: 'OTP sent to registered email.', reused: false });
