@@ -428,12 +428,20 @@ router.post('/client-data', async (req, res) => {
                         AND CAST(o.placed_at AS DATE) = CAST(GETDATE() AS DATE)
                         ORDER BY o.placed_at DESC`)
                 .catch(() => ({ recordset: [] })),
+            // FIX (2026-07-21, rev9): added resolved_isin via a LEFT JOIN to
+            // symbol_master so each day_positions row can be traced back to
+            // its underlying ISIN. Needed below to subtract out any quantity
+            // that's attributable to a Holdings-tab-placed order -- see the
+            // adjustedDayPositions block further down for why.
             pool.request()
                 .input('ucc', sql.VarChar(20), ucc.trim())
                 .input('tradeDate', sql.Date, new Date(tradeDate))
-                .query(`SELECT * FROM day_positions
-                        WHERE ucc = @ucc AND trade_date = @tradeDate
-                        ORDER BY instrument_type, symbol`)
+                .query(`SELECT dp.*, sm.isin AS resolved_isin
+                        FROM day_positions dp
+                        LEFT JOIN symbol_master sm
+                            ON (sm.nse_symbol = dp.symbol OR sm.bse_symbol = dp.symbol)
+                        WHERE dp.ucc = @ucc AND dp.trade_date = @tradeDate
+                        ORDER BY dp.instrument_type, dp.symbol`)
                 .catch(() => ({ recordset: [] })),
             pool.request().input('ucc', sql.VarChar(20), ucc.trim())
                 .query(`SELECT * FROM bf_positions
@@ -647,13 +655,12 @@ router.post('/client-data', async (req, res) => {
         // FIX (2026-07-20, rev8): Sharepro can return MULTIPLE raw rows for
         // the SAME security -- confirmed live: VODAFONE IDEA (ISIN
         // INE669E01016) came back as two separate entries, balance=1 (idn
-        // 85494549) and balance=13 (idn 85494550), true combined holding=14.
-        // Netting used to apply the day's -13 adjustment to EACH row
-        // independently, wrongly dropping BOTH to 0 in the dealer portal too
-        // instead of the single correct answer of 1 (14-13). Merge same-ISIN
-        // rows into one (summing quantity and total_value) BEFORE netting, so
-        // the dealer only ever sees one row per security. Rows with no ISIN
-        // are left unmerged (each treated as its own group).
+        // 85494549) and balance=13 (idn 85494550). NOTE (2026-07-21): the
+        // client has since confirmed their REAL total was 13, not the sum of
+        // both rows (14) -- so summing is provisional pending clarification
+        // on what the extra "balance:1" row represents. Left as-is (sum) for
+        // now per user's own instruction to defer that question and focus on
+        // the Day Position fix (rev9) below; revisit once clarified.
         const mergedHoldingsRaw = new Map();
         for (const h of (holdingsRes.recordset || [])) {
             const key = h.isin || `__no_isin_${mergedHoldingsRaw.size}`;
@@ -679,13 +686,47 @@ router.post('/client-data', async (req, res) => {
             };
         });
 
+        // FIX (2026-07-21, rev9): Day Position must show ONLY activity that
+        // is NOT attributable to a Holdings-tab-placed order. Root cause:
+        // day_positions is populated by the broker/RMS trade feed for the
+        // WHOLE underlying security, regardless of which tab (Day Position
+        // or Holdings) the client used to place the order -- so when the
+        // client sells 13 shares of Vodafone Idea from the HOLDINGS tab,
+        // that same 13-share sell also lands in the raw day_positions row
+        // for ticker "IDEA" (since it's the same ISIN/security), inflating
+        // its sell_qty and making a pre-existing, already-flat day position
+        // (buy=1/sell=1/net=0) look like it still has an open short
+        // position (buy=1/sell=14/net=-13). Per the client's explicit
+        // design requirement, Day Position and Holdings must stay visually
+        // independent in BOTH directions: the earlier fix (rev7, above)
+        // stopped Day-Position-only orders from leaking INTO Holdings; this
+        // does the reverse -- it subtracts Holdings-only order quantity back
+        // OUT of the displayed Day Position row, using the same
+        // isinNetFromSquareoffs map already computed for Holdings netting.
+        // Only CM/EQUITY rows with a resolved_isin are touched (FO/MCX have
+        // no ISIN/Holdings concept, so they pass through unchanged). Clamped
+        // at 0 as a safety net against unexpected negative values.
+        const adjustedDayPositions = dayPos.recordset.map(dp => {
+            if (dp.segment !== 'CM' || dp.instrument_type !== 'EQUITY' || !dp.resolved_isin) return dp;
+            const holdingsNet = isinNetFromSquareoffs.get(dp.resolved_isin);
+            if (!holdingsNet) return dp;
+            const adjBuy  = Math.max(0, Number(dp.buy_qty)  - holdingsNet.buy_qty);
+            const adjSell = Math.max(0, Number(dp.sell_qty) - holdingsNet.sell_qty);
+            return {
+                ...dp,
+                buy_qty:  adjBuy,
+                sell_qty: adjSell,
+                net_qty:  adjBuy - adjSell
+            };
+        });
+
         return res.json({
             success:       true,
             client,
             dealerId:      decoded.dealerId,
             positions:     positions.recordset,
             orders:        orders.recordset,
-            day_positions: dayPos.recordset,
+            day_positions: adjustedDayPositions,
             bf_positions:  bfPos.recordset,
             holdings:      adjustedHoldings,
             trade_date:    tradeDate
