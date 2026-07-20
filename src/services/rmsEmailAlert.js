@@ -5,16 +5,28 @@
  * Sends a BATCHED email to the RMS/surveillance team when one or more
  * square-off orders are placed via Navia Backup.
  *
- * Uses a debounce window (2s, hard-capped at 8s) so that:
- *   - a single client placing multiple scrips/exchanges via Square Off All
- *     results in ONE email listing every order, and
- *   - multiple clients placing square-off requests around the same time
- *     also collapse into ONE email listing all of them,
- * instead of one email per order.
+ * FIX (2026-07-20): batching is now PER SEGMENT (exchange+segment) with a
+ * 30-second debounce, hard-capped at 3 minutes. The previous 2s/8s window
+ * only merged orders placed within the same instant (e.g. a single "Square
+ * Off All" click) -- any orders placed a few seconds or minutes apart, which
+ * is the normal case for manual one-at-a-time placement, each became their
+ * own single-order email. During a busy square-off session (e.g. 100
+ * clients placing 500 orders through the day), that produced one email per
+ * order. Widening the window and keying it per segment means:
+ *   - all orders for the SAME exchange+segment placed within 30s of each
+ *     other (or up to 3 minutes during a sustained stream) collapse into
+ *     ONE email for that segment, and
+ *   - orders for DIFFERENT segments (e.g. NSE CM vs MCX FO) are still kept
+ *     in separate emails rather than mixed into one, so RMS can act on
+ *     each segment's basket independently.
  *
  * The email is TABULAR ONLY -- no file is attached. RMS/technology must
- * log in to the Navia Backup Admin Panel to download/generate the actual
- * basket file for the orders listed in the email.
+ * log in to the Navia Backup Admin Panel and generate the file from there --
+ * that Admin-Panel-generated file is the one treated as the authoritative
+ * Navia Backup order for exchange submission, by design. (An earlier version
+ * of this fix attached a CSV directly to the email; removed per instruction
+ * -- RMS should never act on anything but the Admin Panel's own generated
+ * file.)
  *
  * Email:
  *   To: surveillance@navia.co.in, technology@navia.co.in, monicka@navia.co.in,
@@ -65,14 +77,25 @@ const TO_LIST     = [
 ];
 
 // ── Batching / debounce config ────────────────────────────────────────────────
-const DEBOUNCE_MS = 2000;   // wait this long after the LAST order before sending
-const MAX_WAIT_MS = 8000;   // ...but never delay the alert more than this total
+// FIX (2026-07-20): widened from 2s/8s -- see file header comment.
+const DEBOUNCE_MS = 30000;    // wait this long after the LAST order (for this segment) before sending
+const MAX_WAIT_MS = 180000;   // ...but never delay a segment's alert more than this total
 
-let pendingOrders  = [];
-let debounceTimer  = null;
-let batchStartedAt = null;
+// FIX (2026-07-20): batches are now keyed per "EXCHANGE_SEGMENT" so different
+// segments never get merged into one email, and each segment's own timer
+// runs independently of every other segment's.
+const batches = new Map(); // key -> { orders: [], timer: null, batchStartedAt: null }
 
-// ── Build and send the batched email ──────────────────────────────────────────
+function getBatch(key) {
+    let b = batches.get(key);
+    if (!b) {
+        b = { orders: [], timer: null, batchStartedAt: null };
+        batches.set(key, b);
+    }
+    return b;
+}
+
+// ── Build and send the batched email (always a single exchange+segment) ────────
 async function sendBatchEmail(orders) {
     if (!orders.length) return;
 
@@ -125,7 +148,7 @@ async function sendBatchEmail(orders) {
         <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px;
                     padding:11px 16px;font-size:12px;color:#1e3a8a">
             <strong>Action required:</strong> Log in to the Navia Backup Admin Panel
-            and download the basket file for the
+            and generate/download the basket file for the
             order${orders.length > 1 ? 's' : ''} listed above,
             then upload it to the exchange terminal immediately.
         </div>`;
@@ -263,15 +286,15 @@ async function sendBatchEmail(orders) {
     }
 }
 
-// ── Debounce/flush logic ──────────────────────────────────────────────────────
-function flushQueue() {
-    const batch    = pendingOrders;
-    pendingOrders  = [];
-    debounceTimer  = null;
-    batchStartedAt = null;
+// ── Debounce/flush logic (per segment key) ─────────────────────────────────────
+function flushBatch(key) {
+    const b = batches.get(key);
+    if (!b) return;
+    const orders = b.orders;
+    batches.delete(key);
 
-    if (batch.length) {
-        sendBatchEmail(batch).catch(e =>
+    if (orders.length) {
+        sendBatchEmail(orders).catch(e =>
             console.error('[RMSEmail] Send error:', e.message)
         );
     }
@@ -281,10 +304,12 @@ function flushQueue() {
 /**
  * queueRMSEmailAlert(orderDetails)
  *
- * Queues an order for the RMS alert email. Orders queued within DEBOUNCE_MS
- * of each other (whether from the same client's basket or from different
- * clients placing requests around the same time) are combined into a
- * single email, up to a maximum wait of MAX_WAIT_MS.
+ * Queues an order for the RMS alert email. Orders for the SAME exchange+
+ * segment queued within DEBOUNCE_MS of each other (whether from the same
+ * client's basket or from different clients placing requests around the
+ * same time) are combined into a single email, up to a maximum wait of
+ * MAX_WAIT_MS per segment. Orders for a different segment never share an
+ * email with this one, even if queued at the exact same moment.
  *
  * Always non-blocking (fire and forget).
  */
@@ -301,17 +326,20 @@ function queueRMSEmailAlert(orderDetails) {
         option_type:  orderDetails.option_type  || null,
     };
 
-    pendingOrders.push(order);
-    if (!batchStartedAt) batchStartedAt = Date.now();
+    const key = `${order.exchange}_${order.segment}`;
+    const b   = getBatch(key);
+
+    b.orders.push(order);
+    if (!b.batchStartedAt) b.batchStartedAt = Date.now();
 
     console.log(`[RMSEmail] Queued: ${order.symbol} ${order.exchange}/${order.segment} ` +
-                `UCC:${order.ucc} (batch size: ${pendingOrders.length})`);
+                `UCC:${order.ucc} (batch size for ${key}: ${b.orders.length})`);
 
-    if (debounceTimer) clearTimeout(debounceTimer);
+    if (b.timer) clearTimeout(b.timer);
 
-    const elapsed = Date.now() - batchStartedAt;
+    const elapsed = Date.now() - b.batchStartedAt;
     const waitFor = elapsed >= MAX_WAIT_MS ? 0 : DEBOUNCE_MS;
-    debounceTimer = setTimeout(flushQueue, waitFor);
+    b.timer = setTimeout(() => flushBatch(key), waitFor);
 }
 
 module.exports = { queueRMSEmailAlert };

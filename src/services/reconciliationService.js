@@ -107,10 +107,28 @@ async function reconcileOrder(pool, order) {
     // Fix: subtract the baseline quantity that was snapshotted on this order at
     // the moment it was placed (see orders.js /squareoff -- baseline_qty). Only
     // the genuine INCREMENT since placement counts as "executed" for this order.
-    const baselineQty = Number(order.baseline_qty) || 0;
-    const executedQty = Math.max(0, rawExecutedQty - baselineQty);
+    const baselineQty  = Number(order.baseline_qty) || 0;
+    const requestedQty = Number(order.quantity)     || 0;
+    // FIX (2026-07-20): cap executedQty at requestedQty. baseline_qty is a
+    // point-in-time snapshot taken at order placement -- it can under-count
+    // when a same-day trade for this symbol executed in the real world but
+    // had not yet synced into day_positions at that exact instant (DropCopy
+    // syncs on its own ~30-90s cycle, and the upstream trade file itself can
+    // lag). When that trade syncs in afterward, its quantity has no way to
+    // be told apart from this order's own fill, and gets wrongly added on
+    // top. Confirmed 2026-07-20: a 13-share IDEA square-off was recorded as
+    // executed_qty=14 this way (client had an unrelated morning-session
+    // trade in the same symbol that synced in after this order was placed).
+    // Capping here cannot produce a false UNDER-report -- a genuinely fully
+    // filled order always has rawExecutedQty-baselineQty >= requestedQty
+    // regardless of any extra unrelated same-day volume -- and it guarantees
+    // executed_qty/remaining_qty can never contradict the requested
+    // quantity, which is the concrete symptom reported. A proper fix (per-
+    // trade timestamps instead of a cumulative-minus-snapshot) is a larger
+    // follow-up; this stops the visible overcount today without touching
+    // the matching logic itself.
+    const executedQty = Math.min(requestedQty, Math.max(0, rawExecutedQty - baselineQty));
 
-    const requestedQty  = Number(order.quantity)     || 0;
     const prevExecuted  = Number(order.executed_qty) || 0;
     const remainingQty  = Math.max(0, requestedQty - executedQty);
 
@@ -198,6 +216,7 @@ async function getFOExecutedQty(pool, order) {
             WHERE ucc          = @ucc
             AND   symbol       = @symbol
             AND   exchange     = @exchange
+            AND   segment      = 'FO'
             AND   trade_date   = CAST(GETDATE() AS DATE)
             AND   (
                 (@expiry IS NULL AND expiry_date IS NULL)
