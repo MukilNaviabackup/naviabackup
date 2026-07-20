@@ -451,6 +451,18 @@ router.post('/client-data', async (req, res) => {
             // order outcomes. CM only (Holdings has no FO/MCX rows). ISIN is
             // resolved via symbol_master since squareoff_orders itself doesn't
             // store one.
+            //
+            // FIX (2026-07-20, rev4): filtered on placed_at = today, which is
+            // wrong -- an order can be PLACED days ago (e.g. a previously
+            // stuck/stale order that only later got manually or automatically
+            // reconciled) and only actually TRADE later. Confirmed live: the
+            // VODAFONE IDEA order traces back several days in placed_at, so
+            // "placed_at = today" silently excluded it and Holdings fell back
+            // to unadjusted. What actually matters is whether the trade has
+            // already been absorbed into Sharepro's own (T-1-style) snapshot
+            // yet -- that's governed by traded_at, not placed_at. Orders with
+            // a NULL traded_at (older rows / manual corrections that never
+            // set it) are still included rather than silently dropped.
             pool.request().input('ucc', sql.VarChar(20), ucc.trim())
                 .query(`SELECT sm.isin, o.side, o.executed_qty
                         FROM squareoff_orders o
@@ -460,7 +472,7 @@ router.post('/client-data', async (req, res) => {
                         WHERE o.ucc = @ucc
                         AND o.segment = 'CM'
                         AND o.status IN ('ORDER_TRADED', 'PARTIALLY_TRADED')
-                        AND CAST(o.placed_at AS DATE) = CAST(GETDATE() AS DATE)`)
+                        AND (o.traded_at IS NULL OR CAST(o.traded_at AS DATE) = CAST(GETDATE() AS DATE))`)
                 .catch(() => ({ recordset: [] })),
         ]);
 

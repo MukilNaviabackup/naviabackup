@@ -3,6 +3,7 @@ const express = require('express');
 const router  = express.Router();
 const https   = require('https');
 const NodeCache = require('node-cache');
+const { getConnection, sql } = require('../config/database');
 require('dotenv').config();
 
 // ─── Cache holdings for 5 minutes per UCC ────────────────────────────────────
@@ -65,6 +66,61 @@ function fetchShareproHoldings(ucc, date) {
     });
 }
 
+// FIX (2026-07-20): Sharepro's holdings snapshot does not reflect TODAY's own
+// trades at all (it's a settled/T-1-style snapshot) -- so a holding that's
+// already been fully squared off today still shows its PRE-square-off
+// quantity here, with the dashboard still inviting a duplicate square-off.
+//
+// FIX (2026-07-20, rev2): the first version of this fix netted against
+// day_positions, which logs ALL intraday activity for a symbol regardless of
+// source -- including trades placed outside Navia Backup, or trades that
+// executed on the wrong side due to a broker/RMS-side error. That wrongly
+// pulled unrelated activity into Holdings. Day Position and Holdings are
+// different concepts: Day Position is a raw intraday log; Holdings should
+// move only when the client's OWN square-off order (placed through this app)
+// actually completed. Reads squareoff_orders (ORDER_TRADED/PARTIALLY_TRADED
+// only, CM only), resolving ISIN via symbol_master since squareoff_orders
+// itself doesn't store one.
+//
+// FIX (2026-07-20, rev3): filtered on placed_at = today, which is wrong -- an
+// order can be PLACED days ago (e.g. a previously stuck/stale order that only
+// later got manually or automatically reconciled) and only actually TRADE
+// later. What matters is whether the trade has already been absorbed into
+// Sharepro's own (T-1-style) snapshot yet -- that's governed by traded_at,
+// not placed_at. Orders with a NULL traded_at (older rows / manual
+// corrections that never set it) are still included rather than silently
+// dropped.
+async function fetchTodayTradedSquareoffsByIsin(ucc) {
+    try {
+        const pool = await getConnection();
+        const result = await pool.request()
+            .input('ucc', sql.VarChar(20), ucc.trim())
+            .query(`SELECT sm.isin, o.side, o.executed_qty
+                    FROM squareoff_orders o
+                    JOIN symbol_master sm
+                        ON (o.exchange = 'NSE' AND sm.nse_symbol = o.symbol)
+                        OR (o.exchange = 'BSE' AND sm.bse_symbol = o.symbol)
+                    WHERE o.ucc = @ucc
+                    AND o.segment = 'CM'
+                    AND o.status IN ('ORDER_TRADED', 'PARTIALLY_TRADED')
+                    AND (o.traded_at IS NULL OR CAST(o.traded_at AS DATE) = CAST(GETDATE() AS DATE))`);
+
+        const isinNet = new Map();
+        for (const o of result.recordset) {
+            if (!o.isin) continue;
+            const agg = isinNet.get(o.isin) || { buy_qty: 0, sell_qty: 0 };
+            const qty = Number(o.executed_qty) || 0;
+            if ((o.side || '').toUpperCase() === 'BUY') agg.buy_qty += qty;
+            else agg.sell_qty += qty;
+            isinNet.set(o.isin, agg);
+        }
+        return isinNet;
+    } catch (e) {
+        console.error('[Holdings] squareoff_orders fetch error (non-fatal, holdings shown unadjusted):', e.message);
+        return new Map();
+    }
+}
+
 // ─── GET /api/holdings ────────────────────────────────────────────────────────
 router.get('/', async (req, res) => {
     const token = req.headers['authorization']?.split(' ')[1];
@@ -86,9 +142,12 @@ router.get('/', async (req, res) => {
             return res.json({ ...cached, cached: true });
         }
 
-        // ── Fetch from Sharepro ───────────────────────────────────────────────
+        // ── Fetch from Sharepro (and today's traded square-offs, in parallel) ──
         console.log(`[Holdings] Fetching from Sharepro: UCC=${ucc} Date=${today}`);
-        const result = await fetchShareproHoldings(ucc, today);
+        const [result, isinNet] = await Promise.all([
+            fetchShareproHoldings(ucc, today),
+            fetchTodayTradedSquareoffsByIsin(ucc)
+        ]);
         console.log(`[Holdings] Sharepro status: ${result.status}, raw: ${JSON.stringify(result.data)}`);
 
         if (result.status !== 200) {
@@ -121,7 +180,7 @@ router.get('/', async (req, res) => {
         }
 
         // ── Map holdings data ─────────────────────────────────────────────────
-        const holdings = rawHoldings.map((h, idx) => ({
+        let holdings = rawHoldings.map((h, idx) => ({
             id:           idx + 1,
             isin:         h.isincd?.trim()    || '',
             symbol:       h.compname?.trim()  || '',
@@ -131,6 +190,24 @@ router.get('/', async (req, res) => {
             total_value:  Number(h.holding)   || 0,
             idn:          h.idn?.trim()       || '',
         }));
+
+        // FIX (2026-07-20, rev2): net only this app's own completed square-off
+        // orders into the raw Sharepro quantity. total_value is recomputed
+        // from the adjusted quantity (qty * close_price) rather than left at
+        // Sharepro's raw pre-adjustment value -- otherwise a fully squared-off
+        // holding would show quantity 0 next to a stale non-zero rupee value.
+        // Holdings with no matching traded square-off today are left
+        // completely untouched.
+        holdings = holdings.map(h => {
+            const net = h.isin ? isinNet.get(h.isin) : null;
+            if (!net) return h;
+            const adjustedQty = Math.max(0, Number(h.quantity) - net.sell_qty + net.buy_qty);
+            return {
+                ...h,
+                quantity:    adjustedQty,
+                total_value: Math.round(adjustedQty * h.close_price * 100) / 100
+            };
+        });
 
         const totalValue    = holdings.reduce((s, h) => s + h.total_value, 0);
         const totalQuantity = holdings.reduce((s, h) => s + h.quantity,    0);
