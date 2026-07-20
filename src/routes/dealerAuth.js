@@ -644,7 +644,29 @@ router.post('/client-data', async (req, res) => {
                 isinStatusMap.set(o.isin, { status: st, priority });
             }
         }
-        const adjustedHoldings = (holdingsRes.recordset || []).map(h => {
+        // FIX (2026-07-20, rev8): Sharepro can return MULTIPLE raw rows for
+        // the SAME security -- confirmed live: VODAFONE IDEA (ISIN
+        // INE669E01016) came back as two separate entries, balance=1 (idn
+        // 85494549) and balance=13 (idn 85494550), true combined holding=14.
+        // Netting used to apply the day's -13 adjustment to EACH row
+        // independently, wrongly dropping BOTH to 0 in the dealer portal too
+        // instead of the single correct answer of 1 (14-13). Merge same-ISIN
+        // rows into one (summing quantity and total_value) BEFORE netting, so
+        // the dealer only ever sees one row per security. Rows with no ISIN
+        // are left unmerged (each treated as its own group).
+        const mergedHoldingsRaw = new Map();
+        for (const h of (holdingsRes.recordset || [])) {
+            const key = h.isin || `__no_isin_${mergedHoldingsRaw.size}`;
+            if (!mergedHoldingsRaw.has(key)) {
+                mergedHoldingsRaw.set(key, { ...h });
+            } else {
+                const existing = mergedHoldingsRaw.get(key);
+                existing.quantity    = Number(existing.quantity)    + Number(h.quantity);
+                existing.total_value = Number(existing.total_value) + Number(h.total_value);
+            }
+        }
+        const mergedHoldingsList = Array.from(mergedHoldingsRaw.values()).map((h, idx) => ({ ...h, id: idx + 1 }));
+        const adjustedHoldings = mergedHoldingsList.map(h => {
             const net = h.isin ? isinNetFromSquareoffs.get(h.isin) : null;
             const today_status = h.isin ? normalizeStatus(isinStatusMap.get(h.isin)?.status) : null;
             if (!net) return { ...h, today_status };

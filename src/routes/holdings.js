@@ -290,6 +290,30 @@ router.get('/', async (req, res) => {
             idn:          h.idn?.trim()       || '',
         }));
 
+        // FIX (2026-07-20, rev8): Sharepro can return MULTIPLE raw rows for
+        // the SAME security -- confirmed live: VODAFONE IDEA (ISIN
+        // INE669E01016) came back as two separate entries, balance=1 (idn
+        // 85494549) and balance=13 (idn 85494550), true combined holding=14.
+        // The netting step below used to apply the day's -13 adjustment to
+        // EACH row independently, wrongly dropping BOTH to 0 instead of the
+        // single correct answer of 1 (14-13). Merge same-ISIN rows into one
+        // (summing quantity and total_value) BEFORE any netting/status logic
+        // runs, so the client only ever sees one row per security and the
+        // adjustment is applied exactly once against the true combined total.
+        // Rows with no ISIN are left unmerged (each treated as its own group).
+        const mergedByIsin = new Map();
+        for (const h of holdings) {
+            const key = h.isin || `__no_isin_${mergedByIsin.size}`;
+            if (!mergedByIsin.has(key)) {
+                mergedByIsin.set(key, { ...h });
+            } else {
+                const existing = mergedByIsin.get(key);
+                existing.quantity    = Number(existing.quantity)    + Number(h.quantity);
+                existing.total_value = Number(existing.total_value) + Number(h.total_value);
+            }
+        }
+        holdings = Array.from(mergedByIsin.values()).map((h, idx) => ({ ...h, id: idx + 1 }));
+
         // FIX (2026-07-20, rev2): net only this app's own completed square-off
         // orders into the raw Sharepro quantity. total_value is recomputed
         // from the adjusted quantity (qty * close_price) rather than left at
