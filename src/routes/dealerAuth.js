@@ -476,6 +476,55 @@ router.post('/client-data', async (req, res) => {
             .query(`INSERT INTO dealer_logs (dealer_id, ucc, action, details)
                     VALUES (@dealerId, @ucc, @action, @details)`);
 
+        // FIX (2026-07-20): Sharepro's holdings snapshot does not reflect
+        // TODAY's own trades at all (it's a settled/T-1-style snapshot) -- so
+        // a holding that's already been fully squared off today (via Navia
+        // Backup or any other route reflected in day_positions) still shows
+        // its PRE-square-off quantity here, and Square Off still looks
+        // available as if nothing happened. Confirmed 2026-07-20: UCC
+        // 88707169 sold 14 VODAFONE IDEA shares today (1 unrelated + 13 via
+        // square-off) but Holdings still showed the untouched 14. Net
+        // today's CM buy/sell activity (matched by ISIN, already fetched
+        // above as dayPos, no extra query needed) into the raw holdings
+        // number so it reflects what's actually still available right now.
+        // Holdings with no matching day_position today are left untouched.
+        //
+        // FIX (2026-07-20, rev2): Holdings from Sharepro are a demat-level
+        // snapshot with NO exchange dimension -- a client's holding of ISIN X
+        // is one number regardless of whether they traded it on NSE or BSE.
+        // But day_positions rows are stored per exchange+segment, so the SAME
+        // ISIN can appear in more than one day_positions row today (e.g. a
+        // client buys on NSE CM and sells on BSE CM, same ISIN, same day).
+        // The first version of this fix kept only the LAST matching row per
+        // ISIN (Map.set overwrites), which would silently drop one exchange's
+        // activity from the netting. Fixed to SUM buy_qty/sell_qty across all
+        // day_positions rows sharing that ISIN -- for the common single-
+        // exchange case this is unchanged (sum of one row = that row).
+        const dayPosByIsin = new Map();
+        for (const dp of dayPos.recordset) {
+            if ((dp.instrument_type || '').toUpperCase() !== 'EQUITY' || !dp.isin) continue;
+            const agg = dayPosByIsin.get(dp.isin) || { buy_qty: 0, sell_qty: 0 };
+            agg.buy_qty  += Number(dp.buy_qty)  || 0;
+            agg.sell_qty += Number(dp.sell_qty) || 0;
+            dayPosByIsin.set(dp.isin, agg);
+        }
+        // total_value is recomputed from the adjusted quantity (qty *
+        // close_price) rather than left at Sharepro's raw pre-adjustment
+        // value -- otherwise a fully squared-off holding would show
+        // quantity 0 next to a stale non-zero rupee value in the dealer
+        // portal's Holdings tab. Matches the equivalent fix in holdings.js
+        // (client dashboard's own Holdings route).
+        const adjustedHoldings = (holdingsRes.recordset || []).map(h => {
+            const dp = h.isin ? dayPosByIsin.get(h.isin) : null;
+            if (!dp) return h;
+            const adjustedQty = Math.max(0, Number(h.quantity) - dp.sell_qty + dp.buy_qty);
+            return {
+                ...h,
+                quantity:    adjustedQty,
+                total_value: Math.round(adjustedQty * (Number(h.close_price) || 0) * 100) / 100
+            };
+        });
+
         return res.json({
             success:       true,
             client,
@@ -484,7 +533,7 @@ router.post('/client-data', async (req, res) => {
             orders:        orders.recordset,
             day_positions: dayPos.recordset,
             bf_positions:  bfPos.recordset,
-            holdings:      holdingsRes.recordset || [],
+            holdings:      adjustedHoldings,
             trade_date:    tradeDate
         });
 
@@ -654,7 +703,6 @@ router.post('/place-squareoff', async (req, res) => {
         return res.status(500).json({ error: 'Failed to place order.' });
     }
 });
-
 
 
 // ── Internal helper: fetch holdings from Sharepro (mirrors holdings.js exactly) ─
