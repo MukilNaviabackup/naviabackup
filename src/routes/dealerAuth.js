@@ -455,18 +455,35 @@ router.post('/client-data', async (req, res) => {
             // FIX (2026-07-20, rev4): filtered on placed_at = today, which is
             // wrong -- an order can be PLACED days ago (e.g. a previously
             // stuck/stale order that only later got manually or automatically
-            // reconciled) and only actually TRADE later. Confirmed live: the
-            // VODAFONE IDEA order traces back several days in placed_at, so
-            // "placed_at = today" silently excluded it and Holdings fell back
-            // to unadjusted. What actually matters is whether the trade has
-            // already been absorbed into Sharepro's own (T-1-style) snapshot
-            // yet -- that's governed by traded_at, not placed_at. Orders with
-            // a NULL traded_at (older rows / manual corrections that never
-            // set it) are still included rather than silently dropped.
+            // reconciled) and only actually TRADE later. What actually matters
+            // is whether the trade has already been absorbed into Sharepro's
+            // own (T-1-style) snapshot yet -- that's governed by traded_at,
+            // not placed_at. Orders with a NULL traded_at (older rows /
+            // manual corrections that never set it) are still included
+            // rather than silently dropped.
+            //
+            // FIX (2026-07-20, rev5): the symbol_master JOIN silently failed
+            // for orders placed via the Holdings tab's own "Square off"
+            // button -- that flow stores symbol as the FULL company name
+            // plus ISIN (e.g. "VODAFONE IDEA LIMITED EQ ; INE669E01016"), not
+            // the short ticker ("IDEA") that Day-Position-originated orders
+            // and symbol_master.nse_symbol/bse_symbol use. That mismatch is
+            // why the IDEA order never netted in ANY earlier revision of this
+            // fix, regardless of the date filter used. Extract the ISIN
+            // directly out of the "Company Name ; ISIN" string when present;
+            // fall back to the symbol_master JOIN (now LEFT JOIN, so a
+            // compound-symbol row isn't excluded just for having no
+            // symbol_master match) for normal short-ticker orders.
             pool.request().input('ucc', sql.VarChar(20), ucc.trim())
-                .query(`SELECT sm.isin, o.side, o.executed_qty
+                .query(`SELECT
+                            CASE
+                                WHEN CHARINDEX(' ; ', o.symbol) > 0
+                                    THEN LTRIM(RTRIM(SUBSTRING(o.symbol, CHARINDEX(' ; ', o.symbol) + 3, 50)))
+                                ELSE sm.isin
+                            END AS isin,
+                            o.side, o.executed_qty
                         FROM squareoff_orders o
-                        JOIN symbol_master sm
+                        LEFT JOIN symbol_master sm
                             ON (o.exchange = 'NSE' AND sm.nse_symbol = o.symbol)
                             OR (o.exchange = 'BSE' AND sm.bse_symbol = o.symbol)
                         WHERE o.ucc = @ucc
@@ -525,9 +542,11 @@ router.post('/client-data', async (req, res) => {
         // log; Holdings should move only when NAVIA BACKUP's OWN square-off
         // order actually completed. Netting now uses tradedSquareoffs (this
         // app's own ORDER_TRADED/PARTIALLY_TRADED orders, ISIN-resolved via
-        // symbol_master) instead. Confirmed against two real cases: VODAFONE
-        // IDEA (Navia Backup SELL 13, ORDER_TRADED) correctly nets Holdings
-        // down by 13; BHARAT ELECTRONICS (Navia Backup order never reached
+        // symbol_master or extracted directly out of a compound symbol
+        // string) instead. Confirmed against real cases: VODAFONE IDEA
+        // (Navia Backup SELL 13, ORDER_TRADED, symbol stored as "VODAFONE
+        // IDEA LIMITED EQ ; INE669E01016") correctly nets Holdings down by
+        // 13; BHARAT ELECTRONICS (Navia Backup order never reached
         // ORDER_TRADED because the actual execution came back as the
         // opposite side -- a known broker-side error, not a Navia Backup
         // bug) is correctly left untouched at Sharepro's raw quantity.

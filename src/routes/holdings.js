@@ -90,14 +90,32 @@ function fetchShareproHoldings(ucc, date) {
 // not placed_at. Orders with a NULL traded_at (older rows / manual
 // corrections that never set it) are still included rather than silently
 // dropped.
+//
+// FIX (2026-07-20, rev4): the symbol_master JOIN silently failed for orders
+// placed via the Holdings tab's own "Square off" button -- that flow stores
+// symbol as the FULL company name plus ISIN (e.g. "VODAFONE IDEA LIMITED EQ
+// ; INE669E01016"), not the short ticker ("IDEA") that Day-Position-
+// originated orders and symbol_master.nse_symbol/bse_symbol use. That
+// mismatch is why a Holdings-tab-placed square-off order never netted
+// correctly in ANY earlier revision of this fix, regardless of the date
+// filter used. Extract the ISIN directly out of the "Company Name ; ISIN"
+// string when present; fall back to the symbol_master JOIN (now LEFT JOIN,
+// so a compound-symbol row isn't excluded just for having no symbol_master
+// match) for normal short-ticker orders.
 async function fetchTodayTradedSquareoffsByIsin(ucc) {
     try {
         const pool = await getConnection();
         const result = await pool.request()
             .input('ucc', sql.VarChar(20), ucc.trim())
-            .query(`SELECT sm.isin, o.side, o.executed_qty
+            .query(`SELECT
+                        CASE
+                            WHEN CHARINDEX(' ; ', o.symbol) > 0
+                                THEN LTRIM(RTRIM(SUBSTRING(o.symbol, CHARINDEX(' ; ', o.symbol) + 3, 50)))
+                            ELSE sm.isin
+                        END AS isin,
+                        o.side, o.executed_qty
                     FROM squareoff_orders o
-                    JOIN symbol_master sm
+                    LEFT JOIN symbol_master sm
                         ON (o.exchange = 'NSE' AND sm.nse_symbol = o.symbol)
                         OR (o.exchange = 'BSE' AND sm.bse_symbol = o.symbol)
                     WHERE o.ucc = @ucc
