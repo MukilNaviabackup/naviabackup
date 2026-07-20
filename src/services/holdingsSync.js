@@ -69,42 +69,45 @@ function fetchShareproHoldings(ucc, date) {
 // FIX (2026-07-20): Sharepro's holdings snapshot does not reflect TODAY's own
 // trades at all (it's a settled/T-1-style snapshot) -- so a holding that's
 // already been fully squared off today still shows its PRE-square-off
-// quantity here, with the client-facing dashboard still inviting a duplicate
-// square-off. Same root cause and same fix as routes/dealerAuth.js's
-// /client-data route: net today's CM buy/sell activity (matched by ISIN)
-// into the raw holdings numbers before returning/caching them.
+// quantity here, with the dashboard still inviting a duplicate square-off.
 //
-// Holdings from Sharepro have no exchange dimension -- a client's holding of
-// ISIN X is one number regardless of which exchange they traded it on. But
-// day_positions rows are stored per exchange+segment, so the same ISIN can
-// appear in more than one day_positions row today (e.g. bought on NSE CM,
-// sold on BSE CM). Sum buy_qty/sell_qty across all matching rows per ISIN
-// rather than keying off a single row.
-async function fetchTodayDayPositionsByIsin(ucc) {
+// FIX (2026-07-20, rev2): the first version of this fix netted against
+// day_positions, which logs ALL intraday activity for a symbol regardless of
+// source -- including trades placed outside Navia Backup, or trades that
+// executed on the wrong side due to a broker/RMS-side error. That wrongly
+// pulled unrelated activity into Holdings. Day Position and Holdings are
+// different concepts: Day Position is a raw intraday log; Holdings should
+// move only when the client's OWN square-off order (placed through this app)
+// actually completed. Reads squareoff_orders (ORDER_TRADED/PARTIALLY_TRADED
+// only, today, CM only), resolving ISIN via symbol_master since
+// squareoff_orders itself doesn't store one.
+async function fetchTodayTradedSquareoffsByIsin(ucc) {
     try {
-        const now       = new Date();
-        const istDate   = new Date(now.getTime() + 5.5 * 60 * 60 * 1000);
-        const tradeDate = istDate.toISOString().slice(0, 10);
-
         const pool = await getConnection();
         const result = await pool.request()
             .input('ucc', sql.VarChar(20), ucc.trim())
-            .input('tradeDate', sql.Date, new Date(tradeDate))
-            .query(`SELECT isin, instrument_type, buy_qty, sell_qty
-                    FROM day_positions
-                    WHERE ucc = @ucc AND trade_date = @tradeDate`);
+            .query(`SELECT sm.isin, o.side, o.executed_qty
+                    FROM squareoff_orders o
+                    JOIN symbol_master sm
+                        ON (o.exchange = 'NSE' AND sm.nse_symbol = o.symbol)
+                        OR (o.exchange = 'BSE' AND sm.bse_symbol = o.symbol)
+                    WHERE o.ucc = @ucc
+                    AND o.segment = 'CM'
+                    AND o.status IN ('ORDER_TRADED', 'PARTIALLY_TRADED')
+                    AND CAST(o.placed_at AS DATE) = CAST(GETDATE() AS DATE)`);
 
-        const dayPosByIsin = new Map();
-        for (const dp of result.recordset) {
-            if ((dp.instrument_type || '').toUpperCase() !== 'EQUITY' || !dp.isin) continue;
-            const agg = dayPosByIsin.get(dp.isin) || { buy_qty: 0, sell_qty: 0 };
-            agg.buy_qty  += Number(dp.buy_qty)  || 0;
-            agg.sell_qty += Number(dp.sell_qty) || 0;
-            dayPosByIsin.set(dp.isin, agg);
+        const isinNet = new Map();
+        for (const o of result.recordset) {
+            if (!o.isin) continue;
+            const agg = isinNet.get(o.isin) || { buy_qty: 0, sell_qty: 0 };
+            const qty = Number(o.executed_qty) || 0;
+            if ((o.side || '').toUpperCase() === 'BUY') agg.buy_qty += qty;
+            else agg.sell_qty += qty;
+            isinNet.set(o.isin, agg);
         }
-        return dayPosByIsin;
+        return isinNet;
     } catch (e) {
-        console.error('[Holdings] day_positions fetch error (non-fatal, holdings shown unadjusted):', e.message);
+        console.error('[Holdings] squareoff_orders fetch error (non-fatal, holdings shown unadjusted):', e.message);
         return new Map();
     }
 }
@@ -130,11 +133,11 @@ router.get('/', async (req, res) => {
             return res.json({ ...cached, cached: true });
         }
 
-        // ── Fetch from Sharepro (and today's day_positions, in parallel) ──────
+        // ── Fetch from Sharepro (and today's traded square-offs, in parallel) ──
         console.log(`[Holdings] Fetching from Sharepro: UCC=${ucc} Date=${today}`);
-        const [result, dayPosByIsin] = await Promise.all([
+        const [result, isinNet] = await Promise.all([
             fetchShareproHoldings(ucc, today),
-            fetchTodayDayPositionsByIsin(ucc)
+            fetchTodayTradedSquareoffsByIsin(ucc)
         ]);
         console.log(`[Holdings] Sharepro status: ${result.status}, raw: ${JSON.stringify(result.data)}`);
 
@@ -179,17 +182,17 @@ router.get('/', async (req, res) => {
             idn:          h.idn?.trim()       || '',
         }));
 
-        // FIX (2026-07-20): net today's own buy/sell activity into the raw
-        // Sharepro quantity. total_value is recomputed from the adjusted
-        // quantity (qty * close_price) rather than left at Sharepro's raw
-        // pre-adjustment value -- otherwise a fully squared-off holding would
-        // show quantity 0 next to a stale non-zero rupee value, which is more
-        // confusing than the original bug. Holdings with no matching
-        // day_position today are left completely untouched.
+        // FIX (2026-07-20, rev2): net only this app's own completed square-off
+        // orders into the raw Sharepro quantity. total_value is recomputed
+        // from the adjusted quantity (qty * close_price) rather than left at
+        // Sharepro's raw pre-adjustment value -- otherwise a fully squared-off
+        // holding would show quantity 0 next to a stale non-zero rupee value.
+        // Holdings with no matching traded square-off today are left
+        // completely untouched.
         holdings = holdings.map(h => {
-            const dp = h.isin ? dayPosByIsin.get(h.isin) : null;
-            if (!dp) return h;
-            const adjustedQty = Math.max(0, Number(h.quantity) - dp.sell_qty + dp.buy_qty);
+            const net = h.isin ? isinNet.get(h.isin) : null;
+            if (!net) return h;
+            const adjustedQty = Math.max(0, Number(h.quantity) - net.sell_qty + net.buy_qty);
             return {
                 ...h,
                 quantity:    adjustedQty,
