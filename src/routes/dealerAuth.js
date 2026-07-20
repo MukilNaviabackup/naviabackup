@@ -489,20 +489,26 @@ router.post('/client-data', async (req, res) => {
             // ORDER_TRADED/PARTIALLY_TRADED, so requiring it to be strictly
             // today (no NULL fallback) is the correct, non-double-counting
             // filter.
+            // FIX (2026-07-20, rev7): dropped the symbol_master JOIN/fallback
+            // entirely. That fallback let a Day-Position-placed order (short
+            // ticker, e.g. "BEL") resolve to the same ISIN as a Holdings row
+            // and affect Holdings -- exactly the cross-contamination the user
+            // has repeatedly said must never happen. Holdings must ONLY ever
+            // be affected by orders placed through the Holdings tab's own
+            // Square-off button, which is the only flow that stores symbol as
+            // the compound "Company Name ; ISIN" string. Restricting to
+            // CHARINDEX(' ; ', o.symbol) > 0 makes that the sole, unambiguous
+            // signal -- a Day-Position order (plain short ticker, no ' ; ')
+            // can no longer match here no matter what its ISIN would
+            // otherwise resolve to.
             pool.request().input('ucc', sql.VarChar(20), ucc.trim())
                 .query(`SELECT
-                            CASE
-                                WHEN CHARINDEX(' ; ', o.symbol) > 0
-                                    THEN LTRIM(RTRIM(SUBSTRING(o.symbol, CHARINDEX(' ; ', o.symbol) + 3, 50)))
-                                ELSE sm.isin
-                            END AS isin,
+                            LTRIM(RTRIM(SUBSTRING(o.symbol, CHARINDEX(' ; ', o.symbol) + 3, 50))) AS isin,
                             o.side, o.executed_qty
                         FROM squareoff_orders o
-                        LEFT JOIN symbol_master sm
-                            ON (o.exchange = 'NSE' AND sm.nse_symbol = o.symbol)
-                            OR (o.exchange = 'BSE' AND sm.bse_symbol = o.symbol)
                         WHERE o.ucc = @ucc
                         AND o.segment = 'CM'
+                        AND CHARINDEX(' ; ', o.symbol) > 0
                         AND o.status IN ('ORDER_TRADED', 'PARTIALLY_TRADED')
                         AND CAST(o.traded_at AS DATE) = CAST(GETDATE() AS DATE)`)
                 .catch(() => ({ recordset: [] })),
@@ -515,21 +521,17 @@ router.post('/client-data', async (req, res) => {
             // Day/Net tabs do, surviving a page reload (unlike the client-only
             // placedHoldings flag, which resets on refresh). Scoped to today
             // by EITHER placed_at or traded_at so a pending order placed today
-            // and a trade that completed today are both caught.
+            // and a trade that completed today are both caught. Same
+            // compound-symbol-only restriction as above -- no symbol_master
+            // fallback, so Day Position orders never touch Holdings.
             pool.request().input('ucc', sql.VarChar(20), ucc.trim())
                 .query(`SELECT
-                            CASE
-                                WHEN CHARINDEX(' ; ', o.symbol) > 0
-                                    THEN LTRIM(RTRIM(SUBSTRING(o.symbol, CHARINDEX(' ; ', o.symbol) + 3, 50)))
-                                ELSE sm.isin
-                            END AS isin,
+                            LTRIM(RTRIM(SUBSTRING(o.symbol, CHARINDEX(' ; ', o.symbol) + 3, 50))) AS isin,
                             o.status, o.file_generated
                         FROM squareoff_orders o
-                        LEFT JOIN symbol_master sm
-                            ON (o.exchange = 'NSE' AND sm.nse_symbol = o.symbol)
-                            OR (o.exchange = 'BSE' AND sm.bse_symbol = o.symbol)
                         WHERE o.ucc = @ucc
                         AND o.segment = 'CM'
+                        AND CHARINDEX(' ; ', o.symbol) > 0
                         AND (
                             CAST(o.placed_at AS DATE) = CAST(GETDATE() AS DATE)
                             OR CAST(o.traded_at AS DATE) = CAST(GETDATE() AS DATE)
