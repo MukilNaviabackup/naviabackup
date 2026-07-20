@@ -375,7 +375,7 @@ router.post('/client-data', async (req, res) => {
 
         console.log(`[ClientData] Step 2: client verified ${client.client_name}`);
         // Step 1: Fetch all DB data in parallel (fast, no external calls)
-        const [positions, orders, dayPos, bfPos, tradedSquareoffs] = await Promise.all([
+        const [positions, orders, dayPos, bfPos, tradedSquareoffs, holdingsStatusRows] = await Promise.all([
             pool.request().input('ucc', sql.VarChar(20), ucc.trim())
                 .query(`SELECT * FROM positions WHERE ucc = @ucc ORDER BY symbol`)
                 .catch(() => ({ recordset: [] })),
@@ -474,6 +474,21 @@ router.post('/client-data', async (req, res) => {
             // fall back to the symbol_master JOIN (now LEFT JOIN, so a
             // compound-symbol row isn't excluded just for having no
             // symbol_master match) for normal short-ticker orders.
+            //
+            // FIX (2026-07-20, rev6): the "traded_at IS NULL" safety-net
+            // fallback was wrong -- it doesn't just catch today's orders
+            // that are missing a timestamp, it also catches OLD stuck orders
+            // (e.g. a PARTIALLY_TRADED row placed 6 days ago that never got
+            // traded_at set) and double-counts them against Sharepro's
+            // holdings balance, which already reflects anything that settled
+            // on a previous day. Confirmed live: an old 2026-07-14
+            // PARTIALLY_TRADED VODAFONE IDEA row with traded_at=NULL was
+            // being netted alongside today's genuine 13-share sell, wrongly
+            // producing 14-13-1=0 instead of the correct 14-13=1. traded_at
+            // is reliably set by reconciliationService when an order reaches
+            // ORDER_TRADED/PARTIALLY_TRADED, so requiring it to be strictly
+            // today (no NULL fallback) is the correct, non-double-counting
+            // filter.
             pool.request().input('ucc', sql.VarChar(20), ucc.trim())
                 .query(`SELECT
                             CASE
@@ -489,11 +504,40 @@ router.post('/client-data', async (req, res) => {
                         WHERE o.ucc = @ucc
                         AND o.segment = 'CM'
                         AND o.status IN ('ORDER_TRADED', 'PARTIALLY_TRADED')
-                        AND (o.traded_at IS NULL OR CAST(o.traded_at AS DATE) = CAST(GETDATE() AS DATE))`)
+                        AND CAST(o.traded_at AS DATE) = CAST(GETDATE() AS DATE)`)
+                .catch(() => ({ recordset: [] })),
+            // NEW (2026-07-20, rev7): status-only lookup for the Holdings tab's
+            // action pill. This is intentionally SEPARATE from the netting
+            // query above (which stays untouched) -- that one only cares about
+            // completed trades for quantity math. This one also needs to see
+            // ORDER_RECEIVED/FILE_GENERATED (order placed, not yet executed)
+            // so the Holdings tab can show "Order received" the same way
+            // Day/Net tabs do, surviving a page reload (unlike the client-only
+            // placedHoldings flag, which resets on refresh). Scoped to today
+            // by EITHER placed_at or traded_at so a pending order placed today
+            // and a trade that completed today are both caught.
+            pool.request().input('ucc', sql.VarChar(20), ucc.trim())
+                .query(`SELECT
+                            CASE
+                                WHEN CHARINDEX(' ; ', o.symbol) > 0
+                                    THEN LTRIM(RTRIM(SUBSTRING(o.symbol, CHARINDEX(' ; ', o.symbol) + 3, 50)))
+                                ELSE sm.isin
+                            END AS isin,
+                            o.status, o.file_generated
+                        FROM squareoff_orders o
+                        LEFT JOIN symbol_master sm
+                            ON (o.exchange = 'NSE' AND sm.nse_symbol = o.symbol)
+                            OR (o.exchange = 'BSE' AND sm.bse_symbol = o.symbol)
+                        WHERE o.ucc = @ucc
+                        AND o.segment = 'CM'
+                        AND (
+                            CAST(o.placed_at AS DATE) = CAST(GETDATE() AS DATE)
+                            OR CAST(o.traded_at AS DATE) = CAST(GETDATE() AS DATE)
+                        )`)
                 .catch(() => ({ recordset: [] })),
         ]);
 
-        console.log(`[ClientData] Step 3: DB data fetched positions=${positions.recordset.length} orders=${orders.recordset.length} day=${dayPos.recordset.length} bf=${bfPos.recordset.length} tradedSquareoffs=${tradedSquareoffs.recordset.length}`);
+        console.log(`[ClientData] Step 3: DB data fetched positions=${positions.recordset.length} orders=${orders.recordset.length} day=${dayPos.recordset.length} bf=${bfPos.recordset.length} tradedSquareoffs=${tradedSquareoffs.recordset.length} holdingsStatusRows=${holdingsStatusRows.recordset.length}`);
         // Step 2: Fetch holdings from Sharepro separately with strict timeout
         let holdingsRes = { recordset: [] };
         try {
@@ -565,14 +609,49 @@ router.post('/client-data', async (req, res) => {
         // quantity 0 next to a stale non-zero rupee value in the dealer
         // portal's Holdings tab. Matches the equivalent fix in holdings.js
         // (client dashboard's own Holdings route).
+        //
+        // NEW (2026-07-20, rev7): today_status gives the Holdings tab the
+        // same "Order received / Partially traded / Traded" pill that the
+        // Day/Net tabs already show, instead of the row just silently
+        // changing its quantity number. Highest-priority status per ISIN
+        // wins (Traded > Partially traded > Order received), and Traded /
+        // Partially traded both require file_generated=true -- the same
+        // compliance gate dayEquityActionFor/foActionFor already use, so a
+        // dealer never sees "Traded" here before the client-facing file has
+        // actually been generated.
+        const STATUS_PRIORITY = {
+            ORDER_TRADED: 3, TRADED: 3,
+            PARTIALLY_TRADED: 2,
+            ORDER_RECEIVED: 1, RECEIVED: 1, FILE_GENERATED: 1
+        };
+        const normalizeStatus = (st) => {
+            if (st === 'ORDER_TRADED' || st === 'TRADED') return 'TRADED';
+            if (st === 'PARTIALLY_TRADED') return 'PARTIALLY_TRADED';
+            if (st === 'ORDER_RECEIVED' || st === 'RECEIVED' || st === 'FILE_GENERATED') return 'ORDER_RECEIVED';
+            return null;
+        };
+        const isinStatusMap = new Map();
+        for (const o of holdingsStatusRows.recordset) {
+            if (!o.isin) continue;
+            const st = (o.status || '').toUpperCase();
+            if ((st === 'ORDER_TRADED' || st === 'TRADED' || st === 'PARTIALLY_TRADED') && !o.file_generated) continue;
+            const priority = STATUS_PRIORITY[st];
+            if (!priority) continue;
+            const existing = isinStatusMap.get(o.isin);
+            if (!existing || priority > existing.priority) {
+                isinStatusMap.set(o.isin, { status: st, priority });
+            }
+        }
         const adjustedHoldings = (holdingsRes.recordset || []).map(h => {
             const net = h.isin ? isinNetFromSquareoffs.get(h.isin) : null;
-            if (!net) return h;
+            const today_status = h.isin ? normalizeStatus(isinStatusMap.get(h.isin)?.status) : null;
+            if (!net) return { ...h, today_status };
             const adjustedQty = Math.max(0, Number(h.quantity) - net.sell_qty + net.buy_qty);
             return {
                 ...h,
                 quantity:    adjustedQty,
-                total_value: Math.round(adjustedQty * (Number(h.close_price) || 0) * 100) / 100
+                total_value: Math.round(adjustedQty * (Number(h.close_price) || 0) * 100) / 100,
+                today_status
             };
         });
 
