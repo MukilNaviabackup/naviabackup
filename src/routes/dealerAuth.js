@@ -428,20 +428,21 @@ router.post('/client-data', async (req, res) => {
                         AND CAST(o.placed_at AS DATE) = CAST(GETDATE() AS DATE)
                         ORDER BY o.placed_at DESC`)
                 .catch(() => ({ recordset: [] })),
-            // FIX (2026-07-21, rev9): added resolved_isin via a LEFT JOIN to
-            // symbol_master so each day_positions row can be traced back to
-            // its underlying ISIN. Needed below to subtract out any quantity
-            // that's attributable to a Holdings-tab-placed order -- see the
-            // adjustedDayPositions block further down for why.
+            // REVERTED (2026-07-21, rev11): rev9 subtracted Holdings-tab order
+            // quantity out of this query's results before display, so a
+            // Holdings-tab trade wouldn't show up in Day Position. Client
+            // confirmed (with their manager) that Day Position showing the
+            // RAW, untouched day_positions data -- INCLUDING quantity from a
+            // Holdings-tab trade -- is correct, by design: Day Position is a
+            // raw intraday activity log and should never be adjusted for
+            // Holdings. Reverted back to a plain, unmodified query -- no
+            // symbol_master join, no resolved_isin, no post-fetch adjustment.
             pool.request()
                 .input('ucc', sql.VarChar(20), ucc.trim())
                 .input('tradeDate', sql.Date, new Date(tradeDate))
-                .query(`SELECT dp.*, sm.isin AS resolved_isin
-                        FROM day_positions dp
-                        LEFT JOIN symbol_master sm
-                            ON (sm.nse_symbol = dp.symbol OR sm.bse_symbol = dp.symbol)
-                        WHERE dp.ucc = @ucc AND dp.trade_date = @tradeDate
-                        ORDER BY dp.instrument_type, dp.symbol`)
+                .query(`SELECT * FROM day_positions
+                        WHERE ucc = @ucc AND trade_date = @tradeDate
+                        ORDER BY instrument_type, symbol`)
                 .catch(() => ({ recordset: [] })),
             pool.request().input('ucc', sql.VarChar(20), ucc.trim())
                 .query(`SELECT * FROM bf_positions
@@ -628,7 +629,9 @@ router.post('/client-data', async (req, res) => {
         // Partially traded both require file_generated=true -- the same
         // compliance gate dayEquityActionFor/foActionFor already use, so a
         // dealer never sees "Traded" here before the client-facing file has
-        // actually been generated.
+        // actually been generated. This part STAYS applied -- unaffected by
+        // the rev11 Day Position revert above, which only touched the
+        // day_positions display path, not Holdings.
         const STATUS_PRIORITY = {
             ORDER_TRADED: 3, TRADED: 3,
             PARTIALLY_TRADED: 2,
@@ -658,9 +661,8 @@ router.post('/client-data', async (req, res) => {
         // 85494549) and balance=13 (idn 85494550). NOTE (2026-07-21): the
         // client has since confirmed their REAL total was 13, not the sum of
         // both rows (14) -- so summing is provisional pending clarification
-        // on what the extra "balance:1" row represents. Left as-is (sum) for
-        // now per user's own instruction to defer that question and focus on
-        // the Day Position fix (rev9) below; revisit once clarified.
+        // on what the extra "balance:1" row represents. Still open, tracked
+        // separately from this Day Position revert.
         const mergedHoldingsRaw = new Map();
         for (const h of (holdingsRes.recordset || [])) {
             const key = h.isin || `__no_isin_${mergedHoldingsRaw.size}`;
@@ -686,47 +688,13 @@ router.post('/client-data', async (req, res) => {
             };
         });
 
-        // FIX (2026-07-21, rev9): Day Position must show ONLY activity that
-        // is NOT attributable to a Holdings-tab-placed order. Root cause:
-        // day_positions is populated by the broker/RMS trade feed for the
-        // WHOLE underlying security, regardless of which tab (Day Position
-        // or Holdings) the client used to place the order -- so when the
-        // client sells 13 shares of Vodafone Idea from the HOLDINGS tab,
-        // that same 13-share sell also lands in the raw day_positions row
-        // for ticker "IDEA" (since it's the same ISIN/security), inflating
-        // its sell_qty and making a pre-existing, already-flat day position
-        // (buy=1/sell=1/net=0) look like it still has an open short
-        // position (buy=1/sell=14/net=-13). Per the client's explicit
-        // design requirement, Day Position and Holdings must stay visually
-        // independent in BOTH directions: the earlier fix (rev7, above)
-        // stopped Day-Position-only orders from leaking INTO Holdings; this
-        // does the reverse -- it subtracts Holdings-only order quantity back
-        // OUT of the displayed Day Position row, using the same
-        // isinNetFromSquareoffs map already computed for Holdings netting.
-        // Only CM/EQUITY rows with a resolved_isin are touched (FO/MCX have
-        // no ISIN/Holdings concept, so they pass through unchanged). Clamped
-        // at 0 as a safety net against unexpected negative values.
-        const adjustedDayPositions = dayPos.recordset.map(dp => {
-            if (dp.segment !== 'CM' || dp.instrument_type !== 'EQUITY' || !dp.resolved_isin) return dp;
-            const holdingsNet = isinNetFromSquareoffs.get(dp.resolved_isin);
-            if (!holdingsNet) return dp;
-            const adjBuy  = Math.max(0, Number(dp.buy_qty)  - holdingsNet.buy_qty);
-            const adjSell = Math.max(0, Number(dp.sell_qty) - holdingsNet.sell_qty);
-            return {
-                ...dp,
-                buy_qty:  adjBuy,
-                sell_qty: adjSell,
-                net_qty:  adjBuy - adjSell
-            };
-        });
-
         return res.json({
             success:       true,
             client,
             dealerId:      decoded.dealerId,
             positions:     positions.recordset,
             orders:        orders.recordset,
-            day_positions: adjustedDayPositions,
+            day_positions: dayPos.recordset,
             bf_positions:  bfPos.recordset,
             holdings:      adjustedHoldings,
             trade_date:    tradeDate
@@ -872,7 +840,8 @@ router.post('/place-squareoff', async (req, res) => {
         // the ISIN here (same CHARINDEX(' ; ', symbol) logic already used
         // for compound Holdings-tab symbols elsewhere in this file) lets
         // reconciliation use its intended, unambiguous ISIN JOIN path
-        // instead of the fallback.
+        // instead of the fallback. This part STAYS applied -- unrelated to
+        // the rev11 Day Position revert above.
         const orderIsin = symbol.includes(' ; ')
             ? symbol.substring(symbol.indexOf(' ; ') + 3).trim()
             : null;
