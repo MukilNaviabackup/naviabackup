@@ -854,6 +854,29 @@ router.post('/place-squareoff', async (req, res) => {
         const baselineQty = Number(baselineResult.recordset[0]?.baseline_qty) || 0;
         console.log(`[DealerOrders] Baseline qty captured = ${baselineQty} (${baselineSideCol}) for order ${orderId}`);
 
+        // FIX (2026-07-21, rev10): squareoff_orders.isin was never populated
+        // at insert time, even though the table has the column and
+        // reconciliationService.js specifically checks `if (!order.isin)` to
+        // decide whether to use its clean, unambiguous ISIN-based CM match
+        // (getCMExecutedQty -- JOIN symbol_master ON isin) or fall back to a
+        // fragile first-word/company-name LIKE match
+        // (getCMExecutedQtyBySymbol) against symbol_master. That fallback
+        // takes symbol.split(' ')[0] -- for a Holdings-tab compound symbol
+        // like "BHARAT ELECTRONICS LIMITED EQ ; INE263A01024" that's just
+        // "BHARAT" -- and runs `TOP 1 ... company_name LIKE '%BHARAT%'` with
+        // NO ORDER BY. Confirmed live: this client also holds "BHARAT ROAD
+        // NETWORK LIMITED EQ", so that fuzzy match can silently resolve to
+        // the WRONG company and find zero matching day_positions rows for
+        // it -- leaving the order stuck at FILE_GENERATED forever even
+        // after the real trade confirms in DropCopy. Extracting and storing
+        // the ISIN here (same CHARINDEX(' ; ', symbol) logic already used
+        // for compound Holdings-tab symbols elsewhere in this file) lets
+        // reconciliation use its intended, unambiguous ISIN JOIN path
+        // instead of the fallback.
+        const orderIsin = symbol.includes(' ; ')
+            ? symbol.substring(symbol.indexOf(' ; ') + 3).trim()
+            : null;
+
         await pool.request()
             .input('orderId',     sql.VarChar(50),   orderId)
             .input('ucc',         sql.VarChar(20),   ucc)
@@ -869,16 +892,17 @@ router.post('/place-squareoff', async (req, res) => {
             .input('strike',      sql.Decimal(18,2), strike_price || null)
             .input('optionType',  sql.VarChar(5),    option_type  || null)
             .input('baselineQty', sql.Decimal(18,2), baselineQty)
+            .input('isin',        sql.VarChar(20),   orderIsin)
             .query(`INSERT INTO squareoff_orders
                     (order_id, ucc, exchange, segment, symbol, quantity, side,
                      status, client_name, placed_by, dealer_id,
                      expiry_date, strike_price, option_type, placed_at,
-                     executed_qty, remaining_qty, baseline_qty)
+                     executed_qty, remaining_qty, baseline_qty, isin)
                     VALUES
                     (@orderId, @ucc, @exchange, @segment, @symbol, @quantity, @side,
                      'ORDER_RECEIVED', @clientName, @placedBy, @dealerId,
                      @expiry, @strike, @optionType, GETDATE(),
-                     0, @quantity, @baselineQty)`);
+                     0, @quantity, @baselineQty, @isin)`);
 
         res.json({ success: true, orderId, message: 'Square-off placed successfully.' });
 

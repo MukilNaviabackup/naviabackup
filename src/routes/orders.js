@@ -133,6 +133,31 @@ router.post('/squareoff', authenticate, async (req, res) => {
         const baselineQty = Number(baselineResult.recordset[0]?.baseline_qty) || 0;
         console.log(`[Orders] Step 4.5: baseline qty captured = ${baselineQty} (${baselineSideCol})`);
 
+        // FIX (2026-07-21, rev1): squareoff_orders.isin was never populated
+        // at insert time, even though the table has the column and
+        // reconciliationService.js specifically checks `if (!order.isin)` to
+        // decide whether to use its clean, unambiguous ISIN-based CM match
+        // (getCMExecutedQty -- JOIN symbol_master ON isin) or fall back to a
+        // fragile first-word/company-name LIKE match
+        // (getCMExecutedQtyBySymbol) against symbol_master. That fallback
+        // takes symbol.split(' ')[0] -- for a Holdings-tab compound symbol
+        // like "BHARAT ELECTRONICS LIMITED EQ ; INE263A01024" that's just
+        // "BHARAT" -- and runs `TOP 1 ... company_name LIKE '%BHARAT%'` with
+        // NO ORDER BY, which can silently resolve to the wrong company when
+        // two share a first word (confirmed live on the dealer-placed
+        // equivalent of this same order: this client also holds "BHARAT
+        // ROAD NETWORK LIMITED EQ"). Extracting and storing the ISIN here
+        // (same identical fix already shipped on the dealer route's
+        // /place-squareoff, dealerAuth.js) lets reconciliation use its
+        // intended ISIN JOIN path instead of the fallback for client-placed
+        // Holdings square-offs too. Extracted from the SAME upper-cased
+        // symbol string that actually gets stored below, so the delimiter
+        // check/extraction always matches what's in the row.
+        const symbolUpper = symbol.toUpperCase();
+        const orderIsin = symbolUpper.includes(' ; ')
+            ? symbolUpper.substring(symbolUpper.indexOf(' ; ') + 3).trim()
+            : null;
+
         await pool.request()
             .input('orderId',     sql.VarChar,     orderId)
             .input('ucc',         sql.VarChar,     ucc)
@@ -147,16 +172,17 @@ router.post('/squareoff', authenticate, async (req, res) => {
             .input('strikePrice', sql.Decimal(12,2), strikePrice)
             .input('optType',     sql.VarChar(5),  optType)
             .input('baselineQty', sql.Decimal(18,2), baselineQty)
+            .input('isin',        sql.VarChar(20), orderIsin)
             .query(`INSERT INTO squareoff_orders
                         (order_id, ucc, exchange, segment, symbol, quantity,
                          order_type, side, status, placed_at, rms_notified,
                          placed_by, dealer_id, expiry_date, strike_price, option_type,
-                         executed_qty, remaining_qty, baseline_qty)
+                         executed_qty, remaining_qty, baseline_qty, isin)
                     VALUES
                         (@orderId, @ucc, @exchange, @segment, @symbol, @qty,
                          'MARKET', @side, 'ORDER_RECEIVED', GETDATE(), 0,
                          @placedBy, @dealerId, @expiryDate, @strikePrice, @optType,
-                         0, @qty, @baselineQty)`);
+                         0, @qty, @baselineQty, @isin)`);
 
         console.log(`[Orders] Step 5: order inserted orderId=${orderId}`);
         // ── Update positions table (non-critical) ─────────────────────────
