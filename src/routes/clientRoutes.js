@@ -47,8 +47,8 @@ function parseCSVLine(line) {
 
 function parseCSV(filePath) {
     const content = fs.readFileSync(filePath, 'utf8')
-        .replace(/^\uFEFF/, '')       // Remove BOM
-        .replace(/\u00a0/g, ' ')      // Replace non-breaking spaces
+        .replace(/^﻿/, '')       // Remove BOM
+        .replace(/ /g, ' ')      // Replace non-breaking spaces
         .replace(/\r\n/g, '\n')       // Normalize line endings
         .replace(/\r/g, '\n');
 
@@ -61,7 +61,7 @@ function parseCSV(filePath) {
         const vals = parseCSVLine(lines[i]);
         const row  = {};
         headers.forEach((h, idx) => {
-            row[h] = (vals[idx] || '').trim().replace(/\u00a0/g, ' ');
+            row[h] = (vals[idx] || '').trim().replace(/ /g, ' ');
         });
         rows.push(row);
     }
@@ -118,9 +118,9 @@ router.post('/upload', adminAuthenticate, upload.single('client_file'), async (r
 
         for (const row of rows) {
             try {
-                const ucc  = row['ucc']?.toUpperCase().trim().replace(/\u00a0/g, '');
+                const ucc  = row['ucc']?.toUpperCase().trim().replace(/ /g, '');
                 const dob  = toDate(row['dob']);
-                const name = row['client_name']?.trim().replace(/\u00a0/g, '');
+                const name = row['client_name']?.trim().replace(/ /g, '');
 
                 if (!ucc || !dob || !name || !row['mobile']?.trim() || !row['email']?.trim()) {
                     errors.push(`Skipped: ${ucc || 'unknown'} — missing required field (dob: ${row['dob']}, name: ${name})`);
@@ -583,4 +583,109 @@ router.post('/upsert', async (req, res) => {
         return res.status(500).json({ error: 'Failed to upsert client: ' + err.message });
     }
 });
+
+// ─── GET /api/admin/clients/search ───────────────────────────────────────────
+// Client Search (2026-07-22): search by any one of UCC / Mobile / Email /
+// BO ID / PAN. If more than one field is filled in, they are AND'd together
+// -- harmless in practice since an admin usually fills exactly one box at a
+// time. Returns a results list (there can be more than one match, e.g. a
+// partial UCC) for the frontend to show before drilling into full detail via
+// GET /:ucc/detail below.
+router.get('/search', adminAuthenticate, async (req, res) => {
+    try {
+        const { ucc, mobile, email, bo_id, pan } = req.query;
+
+        if (!ucc?.trim() && !mobile?.trim() && !email?.trim() && !bo_id?.trim() && !pan?.trim()) {
+            return res.status(400).json({ error: 'Provide at least one of: ucc, mobile, email, bo_id, pan.' });
+        }
+
+        const pool       = await getConnection();
+        const request     = pool.request();
+        const conditions = [];
+
+        if (ucc?.trim()) {
+            request.input('ucc', sql.VarChar(20), `%${ucc.trim().toUpperCase()}%`);
+            conditions.push('UPPER(ucc) LIKE @ucc');
+        }
+        if (mobile?.trim()) {
+            request.input('mobile', sql.VarChar(15), `%${mobile.trim()}%`);
+            conditions.push('mobile LIKE @mobile');
+        }
+        if (email?.trim()) {
+            request.input('email', sql.VarChar(100), `%${email.trim().toLowerCase()}%`);
+            conditions.push('LOWER(email) LIKE @email');
+        }
+        if (bo_id?.trim()) {
+            request.input('boId', sql.VarChar(20), `%${bo_id.trim().toUpperCase()}%`);
+            conditions.push('UPPER(bo_id) LIKE @boId');
+        }
+        if (pan?.trim()) {
+            request.input('pan', sql.VarChar(10), `%${pan.trim().toUpperCase()}%`);
+            conditions.push('UPPER(pan) LIKE @pan');
+        }
+
+        const result = await request.query(`
+            SELECT TOP 100
+                client_id, ucc, client_name, email, mobile, pan, bo_id, dp_id,
+                account_status, is_active, terminal, created_at
+            FROM clients
+            WHERE ${conditions.join(' AND ')}
+            ORDER BY client_name
+        `);
+
+        return res.json({ success: true, clients: result.recordset, count: result.recordset.length });
+    } catch (err) {
+        console.error('[Client Search] Error:', err.message);
+        return res.status(500).json({ error: 'Search failed: ' + err.message });
+    }
+});
+
+// ─── GET /api/admin/clients/:ucc/detail ──────────────────────────────────────
+// Client Search (2026-07-22): full client detail for the results-to-detail
+// drill-down, including the 4-state (Active/Reactive/Suspend/Closed) segment
+// status from the new client_segment_status table (see
+// client_segment_status.migration.sql). Display-only -- nothing here writes
+// to client_segment_status; that comes in a later round. Does not read or
+// touch the existing nse_cm/nse_fo/etc bit flags for anything other than
+// showing them alongside the new segment-status table for reference.
+router.get('/:ucc/detail', adminAuthenticate, async (req, res) => {
+    try {
+        const ucc = req.params.ucc?.toUpperCase().trim();
+        if (!ucc) return res.status(400).json({ error: 'UCC is required.' });
+
+        const pool = await getConnection();
+        const clientRes = await pool.request()
+            .input('ucc', sql.VarChar(20), ucc)
+            .query(`
+                SELECT client_id, ucc, client_name, email, mobile, dob, pan,
+                       dp_id, bo_id, account_status, is_active,
+                       nse_cm, nse_fo, nse_cd, bse_cm, bse_fo, bse_cd, mcx_fo,
+                       address, pincode, city, state, terminal,
+                       created_at, modified_at, modified_by, last_synced_at
+                FROM clients
+                WHERE ucc = @ucc
+            `);
+
+        if (clientRes.recordset.length === 0) {
+            return res.status(404).json({ error: `Client with UCC ${ucc} not found.` });
+        }
+
+        const client = clientRes.recordset[0];
+
+        const segRes = await pool.request()
+            .input('clientId', sql.Int, client.client_id)
+            .query(`
+                SELECT exchange, segment, status, updated_at, updated_by
+                FROM client_segment_status
+                WHERE client_id = @clientId
+                ORDER BY exchange, segment
+            `);
+
+        return res.json({ success: true, client, segment_status: segRes.recordset });
+    } catch (err) {
+        console.error('[Client Detail] Error:', err.message);
+        return res.status(500).json({ error: 'Failed to fetch client detail: ' + err.message });
+    }
+});
+
 module.exports = router;
