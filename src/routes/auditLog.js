@@ -151,7 +151,7 @@ router.get('/logs', validateAuditToken, async (req, res) => {
                                          AS details,
                         NULL             AS ip,
                         o.status         AS status
-                    FROM orders o
+                    FROM squareoff_orders o
                     LEFT JOIN clients c ON o.ucc = c.ucc
                     WHERE CAST(o.placed_at AS DATE) = @date
                     ORDER BY o.placed_at DESC
@@ -301,7 +301,7 @@ router.get('/orders', validateAuditToken, async (req, res) => {
                     o.status,
                     o.placed_by,
                     o.dealer_id
-                FROM orders o
+                FROM squareoff_orders o
                 LEFT JOIN clients c ON o.ucc = c.ucc
                 WHERE CAST(o.placed_at AS DATE) = @date
                 ORDER BY o.placed_at DESC
@@ -421,7 +421,7 @@ router.get('/client-activity', validateAuditToken, async (req, res) => {
             pool.request().input('ucc', sql.VarChar(20), ucc)
                 .query(`SELECT ucc, client_name, mobile, email FROM clients WHERE ucc = @ucc`),
             pool.request().input('ucc', sql.VarChar(20), ucc).input('date', sql.Date, new Date(date))
-                .query(`SELECT * FROM orders WHERE ucc = @ucc AND CAST(placed_at AS DATE) = @date ORDER BY placed_at DESC`),
+                .query(`SELECT * FROM squareoff_orders WHERE ucc = @ucc AND CAST(placed_at AS DATE) = @date ORDER BY placed_at DESC`),
             pool.request().input('ucc', sql.VarChar(20), ucc).input('date', sql.Date, new Date(date))
                 .query(`SELECT * FROM day_positions WHERE ucc = @ucc AND trade_date = @date ORDER BY instrument_type, symbol`),
             // FIX: was always pulling the MOST RECENT biz_date ever uploaded,
