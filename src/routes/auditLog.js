@@ -1,25 +1,42 @@
 'use strict';
 const express = require('express');
 const router  = express.Router();
+const jwt     = require('jsonwebtoken');
 const { getConnection, sql } = require('../config/database');
 require('dotenv').config();
 
-// ── Validate read-only audit token ────────────────────────────────────────────
-const crypto = require('crypto');
-
+// ── Validate admin token ──────────────────────────────────────────────────────
+// This previously checked the request's token against a separate
+// AUDIT_READ_TOKEN shared secret (a SHA-256 hash comparison), unrelated to
+// the normal admin login JWT. The Audit Logs page (AuditLogs.jsx) was never
+// given that secret anywhere -- it just sends the logged-in admin's regular
+// login token (the same one every other admin page uses), so the hash never
+// matched and every request failed with "Invalid audit token." regardless of
+// whether the admin was correctly logged in.
+//
+// Fixed to verify the same admin JWT (jwt.verify against JWT_SECRET) that
+// every other admin route already relies on -- so Audit Logs works exactly
+// like Dealer Access, Client Search, Segment Control, etc. Accepts the token
+// from the Authorization header (what the page's fetch() calls send) or a
+// `token` query param (what the "Export CSV" link sends, since a plain
+// <a href> download can't set custom headers) -- both already supported by
+// the existing frontend, nothing there needs to change.
 function validateAuditToken(req, res, next) {
-    const token = req.headers['x-audit-token'] || req.query.token;
+    const authHeader = req.headers['authorization'];
+    const token = (authHeader && authHeader.split(' ')[1])
+        || req.headers['x-audit-token']
+        || req.query.token;
     if (!token) {
         return res.status(401).json({ error: 'Audit token required.' });
     }
-    const tokenHash = crypto
-        .createHash('sha256')
-        .update(token)
-        .digest('hex');
-    if (tokenHash !== process.env.AUDIT_READ_TOKEN) {
-        return res.status(401).json({ error: 'Invalid audit token.' });
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        if (!decoded.adminId) return res.status(401).json({ error: 'Invalid audit token.' });
+        req.admin = decoded;
+        next();
+    } catch (err) {
+        return res.status(401).json({ error: 'Invalid or expired audit token.' });
     }
-    next();
 }
 
 // ── Helper: get IST date string ───────────────────────────────────────────────
@@ -32,7 +49,7 @@ function getISTDate(dateStr) {
 
 // ── GET /api/audit/logs ───────────────────────────────────────────────────────
 // Query params: date (YYYY-MM-DD), type (all/client/admin/dealer/order/dropcopy)
-// Headers: x-audit-token OR query param: token
+// Headers: Authorization: Bearer <admin JWT> (or ?token= for CSV download)
 router.get('/logs', validateAuditToken, async (req, res) => {
     const date   = getISTDate(req.query.date);
     const type   = req.query.type || 'all';
