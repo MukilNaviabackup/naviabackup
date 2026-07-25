@@ -5,6 +5,14 @@ const { getConnection, sql } = require('../config/database');
 const { adminAuthenticate, requireFullAdmin } = require('../middleware/adminAuthenticate');
 require('dotenv').config();
 
+// Segment Control (2026-07-25): the terminals a segment can be routed
+// through. XTS added as a third terminal alongside the existing INHOUSE/BOW.
+// A segment now supports MULTIPLE terminals at once, stored as a
+// comma-separated string in segment_controls.terminals (e.g. "INHOUSE,XTS").
+// The legacy single-value `terminal` column is left in place, untouched by
+// reads, so nothing else that may reference it elsewhere breaks.
+const VALID_TERMINALS = ['INHOUSE', 'BOW', 'XTS'];
+
 function createTransporter() {
     return nodemailer.createTransport({
         host: process.env.SMTP_HOST || 'smtp.zatpatmail.com',
@@ -77,20 +85,24 @@ router.get('/segments', adminAuthenticate, async (req, res) => {
 
 // ── POST /api/admin/control/segments/toggle ───────────────────────────────────
 router.post('/segments/toggle', adminAuthenticate, requireFullAdmin, async (req, res) => {
-    const { exchange, segment, enable, notes, terminal } = req.body;
+    const { exchange, segment, enable, notes, terminals } = req.body;
     if (!exchange || !segment)
         return res.status(400).json({ error: 'Exchange and segment are required.' });
-    if (enable && !terminal)
-        return res.status(400).json({ error: 'Please select a terminal (INHOUSE or BOW) before enabling a segment.', code: 'TERMINAL_REQUIRED' });
+    const termList = Array.isArray(terminals)
+        ? terminals.map(t => (t || '').toUpperCase()).filter(t => VALID_TERMINALS.includes(t))
+        : [];
+    if (enable && termList.length === 0)
+        return res.status(400).json({ error: 'Please select at least one terminal (Inhouse, BoW or XTS) before enabling a segment.', code: 'TERMINAL_REQUIRED' });
+    const termsStr = termList.length > 0 ? termList.join(',') : null;
     try {
         const pool = await getConnection();
         await pool.request()
-            .input('exchange', sql.VarChar, exchange.toUpperCase())
-            .input('segment',  sql.VarChar, segment.toUpperCase())
-            .input('enable',   sql.Bit,     enable ? 1 : 0)
-            .input('adminId',  sql.Int,     req.admin.adminId)
-            .input('notes',    sql.VarChar, notes || '')
-            .input('terminal', sql.VarChar(10), terminal ? terminal.toUpperCase() : null)
+            .input('exchange',  sql.VarChar, exchange.toUpperCase())
+            .input('segment',   sql.VarChar, segment.toUpperCase())
+            .input('enable',    sql.Bit,     enable ? 1 : 0)
+            .input('adminId',   sql.Int,     req.admin.adminId)
+            .input('notes',     sql.VarChar, notes || '')
+            .input('terminals', sql.VarChar(50), termsStr)
             .query(`UPDATE segment_controls SET
                     is_enabled  = @enable,
                     enabled_by  = CASE WHEN @enable = 1 THEN @adminId ELSE enabled_by  END,
@@ -98,7 +110,8 @@ router.post('/segments/toggle', adminAuthenticate, requireFullAdmin, async (req,
                     disabled_by = CASE WHEN @enable = 0 THEN @adminId ELSE disabled_by END,
                     disabled_at = CASE WHEN @enable = 0 THEN GETDATE() ELSE disabled_at END,
                     notes       = @notes,
-                    terminal    = CASE WHEN @terminal IS NOT NULL THEN @terminal WHEN @enable = 0 THEN NULL ELSE terminal END
+                    terminals   = CASE WHEN @terminals IS NOT NULL THEN @terminals WHEN @enable = 0 THEN NULL ELSE terminals END,
+                    terminal    = CASE WHEN @enable = 0 THEN NULL ELSE terminal END
                     WHERE exchange = @exchange AND segment = @segment`);
         await pool.request()
             .input('adminId', sql.Int,     req.admin.adminId)
@@ -109,6 +122,48 @@ router.post('/segments/toggle', adminAuthenticate, requireFullAdmin, async (req,
     } catch (err) {
         console.error('Segment toggle error:', err);
         return res.status(500).json({ error: 'Failed to update segment.' });
+    }
+});
+
+// ── POST /api/admin/control/segments/terminals ────────────────────────────────
+// Updates which terminal(s) are actively serving an ALREADY-ENABLED segment,
+// without touching is_enabled/enabled_at/disabled_at. Lets an admin swap a
+// terminal live (e.g. Inhouse goes down mid-day -> tick BoW, untick Inhouse)
+// without a disable/enable cycle that would interrupt client access.
+router.post('/segments/terminals', adminAuthenticate, requireFullAdmin, async (req, res) => {
+    const { exchange, segment, terminals } = req.body;
+    if (!exchange || !segment)
+        return res.status(400).json({ error: 'Exchange and segment are required.' });
+    const termList = Array.isArray(terminals)
+        ? terminals.map(t => (t || '').toUpperCase()).filter(t => VALID_TERMINALS.includes(t))
+        : [];
+    const termsStr = termList.length > 0 ? termList.join(',') : null;
+    try {
+        const pool  = await getConnection();
+        const check = await pool.request()
+            .input('exchange', sql.VarChar, exchange.toUpperCase())
+            .input('segment',  sql.VarChar, segment.toUpperCase())
+            .query(`SELECT is_enabled FROM segment_controls WHERE exchange = @exchange AND segment = @segment`);
+        if (!check.recordset[0])
+            return res.status(404).json({ error: 'Segment not found.' });
+        if (!check.recordset[0].is_enabled)
+            return res.status(400).json({ error: 'Segment is disabled. Use Enable to set its terminal(s).' });
+
+        await pool.request()
+            .input('exchange',  sql.VarChar, exchange.toUpperCase())
+            .input('segment',   sql.VarChar, segment.toUpperCase())
+            .input('terminals', sql.VarChar(50), termsStr)
+            .query(`UPDATE segment_controls SET terminals = @terminals
+                    WHERE exchange = @exchange AND segment = @segment`);
+        await pool.request()
+            .input('adminId', sql.Int,     req.admin.adminId)
+            .input('action',  sql.VarChar, 'SEGMENT_TERMINALS_UPDATED')
+            .input('details', sql.VarChar, `${exchange} ${segment} terminals set to ${termsStr || 'none'}`)
+            .query(`INSERT INTO admin_logs (admin_id, action, details) VALUES (@adminId, @action, @details)`);
+        return res.json({ success: true, message: `Terminal(s) updated for ${exchange} ${segment}.` });
+    } catch (err) {
+        console.error('Segment terminals update error:', err);
+        return res.status(500).json({ error: 'Failed to update terminals.' });
     }
 });
 
@@ -155,21 +210,25 @@ router.post('/communicate', adminAuthenticate, requireFullAdmin, async (req, res
         if (!segColumn)
             return res.status(400).json({ error: `Unknown segment: ${exchange} ${segment}` });
 
-        // Fetch this segment's assigned terminal, then filter clients by it
+        // Fetch this segment's active terminal(s), then filter clients by
+        // them. `terminals` is a comma-separated list (e.g. "INHOUSE,XTS")
+        // now that a segment can be served by more than one terminal at
+        // once; fall back to the legacy single `terminal` column for any row
+        // not yet migrated.
         const scRes = await pool.request()
             .input('exchange', sql.VarChar(10), exchange.toUpperCase())
             .input('segment',  sql.VarChar(10), segment.toUpperCase())
-            .query(`SELECT terminal FROM segment_controls WHERE exchange = @exchange AND segment = @segment`);
-        const segTerminal = scRes.recordset[0]?.terminal || null;
+            .query(`SELECT terminals, terminal FROM segment_controls WHERE exchange = @exchange AND segment = @segment`);
+        const segTerminals = scRes.recordset[0]?.terminals || scRes.recordset[0]?.terminal || null;
 
         const clientResult = await pool.request()
-            .input('segTerminal', sql.VarChar(10), segTerminal)
+            .input('segTerminals', sql.VarChar(50), segTerminals)
             .query(`SELECT ucc, client_name, mobile, email
                     FROM clients
                     WHERE ${segColumn} = 1
                     AND is_active = 1
                     AND account_status = 'ACTIVE'
-                    AND (@segTerminal IS NULL OR terminal = @segTerminal)`);
+                    AND (@segTerminals IS NULL OR CHARINDEX(',' + terminal + ',', ',' + @segTerminals + ',') > 0)`);
         const clients = clientResult.recordset;
 
         if (clients.length === 0)
