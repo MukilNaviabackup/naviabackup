@@ -21,26 +21,69 @@ const { adminAuthenticate }  = require('../middleware/adminAuthenticate');
 const OTP_SENT_SUFFIX     = '%OTP_SENT%';
 const LOGIN_FAILED_SUFFIX = '%LOGIN_FAILED%';
 
-function applyTypeFilters(request, where, { type, type_contains }) {
+// FIX (2026-07-27, rev2): GET / ran the row query and the COUNT(*) query as
+// two SEPARATE mssql `request` objects sharing the same interpolated `where`
+// string, but only the row-query request ever had .input() called for the
+// params that string references -- the count-query request was always a
+// bare `pool.request()` with nothing bound to it. This was latent and never
+// fired before, because "From Date" used to load blank, so on first page
+// load `where` was always the param-free 'WHERE 1=1' and there was nothing
+// for the count query to fail on. Now that "From Date" defaults to today
+// (this same fix pass), every load includes '@from', so the count query
+// started throwing "Must declare the scalar variable '@from'" on every
+// single request -- a 500 the frontend swallows silently, which is why the
+// whole System Logs page went blank (no cards, "No logs found") instead of
+// just showing wrong counts. buildLogFilter() returns the where-clause
+// string AND a list of binder functions; both the row-query request and the
+// count-query request now run every binder, so both always carry the exact
+// same parameters.
+function buildLogFilter({ type, type_contains, actor_type, ucc, status, from, to, search }) {
+    let where = 'WHERE 1=1';
+    const binders = [];
+
     if (type) {
         const types = type.split(',').map(t => t.trim()).filter(Boolean);
         if (types.length > 1) {
             const paramNames = types.map((t, i) => {
                 const p = `type${i}`;
-                request.input(p, sql.VarChar(100), t);
+                binders.push(r => r.input(p, sql.VarChar(100), t));
                 return `@${p}`;
             });
             where += ` AND log_type IN (${paramNames.join(',')})`;
         } else if (types.length === 1) {
             where += ' AND log_type = @type';
-            request.input('type', sql.VarChar(100), types[0]);
+            binders.push(r => r.input('type', sql.VarChar(100), types[0]));
         }
     }
     if (type_contains) {
         where += ' AND log_type LIKE @typeContains';
-        request.input('typeContains', sql.VarChar(100), `%${type_contains}%`);
+        binders.push(r => r.input('typeContains', sql.VarChar(100), `%${type_contains}%`));
     }
-    return where;
+    if (actor_type) {
+        where += ' AND actor_type = @actorType';
+        binders.push(r => r.input('actorType', sql.VarChar(20), actor_type));
+    }
+    if (ucc) {
+        where += ' AND ucc = @ucc';
+        binders.push(r => r.input('ucc', sql.VarChar(20), ucc));
+    }
+    if (status) {
+        where += ' AND status = @status';
+        binders.push(r => r.input('status', sql.VarChar(20), status));
+    }
+    if (from) {
+        where += ' AND created_at >= @from';
+        binders.push(r => r.input('from', sql.DateTime, new Date(from)));
+    }
+    if (to) {
+        where += ' AND created_at <= @to';
+        binders.push(r => r.input('to', sql.DateTime, new Date(to)));
+    }
+    if (search) {
+        where += ' AND (details LIKE @search OR actor LIKE @search OR ucc LIKE @search)';
+        binders.push(r => r.input('search', sql.VarChar(100), `%${search}%`));
+    }
+    return { where, binders };
 }
 
 // ─── GET /api/admin/logs ──────────────────────────────────────────────────────
@@ -55,40 +98,17 @@ router.get('/', adminAuthenticate, async (req, res) => {
 
         const offset = (parseInt(page) - 1) * parseInt(limit);
         const pool   = await getConnection();
-        const request = pool.request()
+
+        const { where, binders } = buildLogFilter({ type, type_contains, actor_type, ucc, status, from, to, search });
+
+        const listRequest = pool.request()
             .input('offset', sql.Int, offset)
             .input('limit',  sql.Int, parseInt(limit));
-
-        let where = 'WHERE 1=1';
-
-        where = applyTypeFilters(request, where, { type, type_contains });
-        if (actor_type) {
-            where += ' AND actor_type = @actorType';
-            request.input('actorType', sql.VarChar(20), actor_type);
-        }
-        if (ucc) {
-            where += ' AND ucc = @ucc';
-            request.input('ucc', sql.VarChar(20), ucc);
-        }
-        if (status) {
-            where += ' AND status = @status';
-            request.input('status', sql.VarChar(20), status);
-        }
-        if (from) {
-            where += ' AND created_at >= @from';
-            request.input('from', sql.DateTime, new Date(from));
-        }
-        if (to) {
-            where += ' AND created_at <= @to';
-            request.input('to', sql.DateTime, new Date(to));
-        }
-        if (search) {
-            where += ' AND (details LIKE @search OR actor LIKE @search OR ucc LIKE @search)';
-            request.input('search', sql.VarChar(100), `%${search}%`);
-        }
+        const countRequest = pool.request();
+        binders.forEach(bind => { bind(listRequest); bind(countRequest); });
 
         const [logsResult, countResult] = await Promise.all([
-            request.query(`
+            listRequest.query(`
                 SELECT log_id, log_type, actor, actor_type, ucc,
                        ip_address, details, status, meta, created_at
                 FROM system_logs
@@ -96,7 +116,7 @@ router.get('/', adminAuthenticate, async (req, res) => {
                 ORDER BY created_at DESC
                 OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY
             `),
-            pool.request().query(`SELECT COUNT(*) AS total FROM system_logs ${where}`)
+            countRequest.query(`SELECT COUNT(*) AS total FROM system_logs ${where}`)
         ]);
 
         return res.json({
@@ -188,14 +208,11 @@ router.get('/client/:ucc', adminAuthenticate, async (req, res) => {
 // Export logs as CSV
 router.get('/export', adminAuthenticate, async (req, res) => {
     try {
-        const { from, to, type, type_contains } = req.query;
         const pool    = await getConnection();
         const request = pool.request();
 
-        let where = 'WHERE 1=1';
-        if (from) { where += ' AND created_at >= @from'; request.input('from', sql.DateTime, new Date(from)); }
-        if (to)   { where += ' AND created_at <= @to';   request.input('to',   sql.DateTime, new Date(to)); }
-        where = applyTypeFilters(request, where, { type, type_contains });
+        const { where, binders } = buildLogFilter(req.query);
+        binders.forEach(bind => bind(request));
 
         const result = await request.query(`
             SELECT log_id, log_type, actor, actor_type, ucc,
