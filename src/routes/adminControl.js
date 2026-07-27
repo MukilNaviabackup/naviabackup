@@ -5,6 +5,27 @@ const { getConnection, sql } = require('../config/database');
 const { adminAuthenticate, requireFullAdmin } = require('../middleware/adminAuthenticate');
 require('dotenv').config();
 
+// System Logs fix (2026-07-27): successful WhatsApp alert campaigns never
+// wrote to system_logs, so the "WhatsApp Alerts Today" card on the System
+// Logs page was always stuck at 0 no matter how many Alert Clients sends
+// went out. One row per campaign (not per recipient) is written here,
+// mirroring how the Segment Control admin_logs entries summarize a single
+// admin action rather than flooding the log with one row per client.
+async function writeSystemLog(pool, logType, actor, actorType, details, status) {
+    try {
+        await pool.request()
+            .input('logType',   sql.VarChar(100),  logType)
+            .input('actor',     sql.VarChar(100),  actor     || null)
+            .input('actorType', sql.VarChar(20),   actorType || 'ADMIN')
+            .input('details',   sql.NVarChar(500), details   || null)
+            .input('status',    sql.VarChar(20),   status    || 'SUCCESS')
+            .query(`INSERT INTO system_logs (log_type,actor,actor_type,ucc,ip_address,details,status,created_at)
+                    VALUES (@logType,@actor,@actorType,NULL,NULL,@details,@status,GETDATE())`);
+    } catch (err) {
+        console.error('[SystemLog] adminControl write failed:', err.message);
+    }
+}
+
 // Segment Control (2026-07-25, terminal-first redesign): a segment's
 // is_enabled/terminals are now DERIVED from which terminals are switched on
 // and which exchange+segment combinations each one covers -- there is no
@@ -434,6 +455,12 @@ router.post('/communicate', adminAuthenticate, requireFullAdmin, async (req, res
 
             // Small delay to avoid rate limiting
             await new Promise(resolve => setTimeout(resolve, 150));
+        }
+
+        if (send_whatsapp && whatsappSent > 0) {
+            await writeSystemLog(pool, 'ALERT_WHATSAPP_SENT', String(req.admin.adminId), 'ADMIN',
+                `WhatsApp alert sent for ${exchange.toUpperCase()} ${segment.toUpperCase()} to ${whatsappSent} of ${clients.length} clients`,
+                'SUCCESS');
         }
 
         return res.json({

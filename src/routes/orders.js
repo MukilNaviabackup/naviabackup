@@ -6,6 +6,31 @@ const { v4: uuidv4 } = require('uuid');
 const { sendRMSAlert } = require('../services/notificationService');
 const { queueRMSEmailAlert } = require('../services/rmsEmailAlert');
 
+// System Logs fix (2026-07-27): square-off placement never wrote to
+// system_logs at all, so the "Sq-Offs Today" card on the System Logs page
+// was always stuck at 0 regardless of actual activity. Fire-and-forget,
+// matching the same non-blocking pattern used by writeLog() in
+// auth.js/dealerAuth.js -- never allowed to slow down or fail the response.
+function writeLog(logType, actor, actorType, ucc, ip, details, status) {
+    setImmediate(async () => {
+        try {
+            const pool = await getConnection();
+            await pool.request()
+                .input('logType',   sql.VarChar(100),  logType   || 'UNKNOWN')
+                .input('actor',     sql.VarChar(100),  actor     || null)
+                .input('actorType', sql.VarChar(20),   actorType || 'CLIENT')
+                .input('ucc',       sql.VarChar(20),   ucc       || null)
+                .input('ip',        sql.VarChar(50),   ip        || null)
+                .input('details',   sql.NVarChar(500), details   || null)
+                .input('status',    sql.VarChar(20),   status    || 'SUCCESS')
+                .query(`INSERT INTO system_logs (log_type,actor,actor_type,ucc,ip_address,details,status,created_at)
+                        VALUES (@logType,@actor,@actorType,@ucc,@ip,@details,@status,GETDATE())`);
+        } catch (err) {
+            console.error('[SystemLog] orders write failed:', err.message);
+        }
+    });
+}
+
 // Place a square-off order
 router.post('/squareoff', authenticate, async (req, res) => {
     const {
@@ -14,6 +39,7 @@ router.post('/squareoff', authenticate, async (req, res) => {
         dealerId, placedBy
     } = req.body;
     const { ucc, loginType } = req.user;
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || null;
 
     // ── Block SSO only if it is NOT a dealer SSO ──────────────────────────
     const isDealer = !!(dealerId || placedBy);
@@ -202,6 +228,10 @@ router.post('/squareoff', authenticate, async (req, res) => {
             orderId,
             message: 'Square-off request received. RMS team has been notified.'
         });
+
+        writeLog('SQUAREOFF_PLACED', ucc, placedByVal, ucc, ip,
+            `${symbol.toUpperCase()} ${side.toUpperCase()} ${quantity} sq-off placed (${exchange.toUpperCase()} ${segment.toUpperCase()})`,
+            'SUCCESS');
 
         // Send RMS notification in background — never blocks the response
         sendRMSAlert({
