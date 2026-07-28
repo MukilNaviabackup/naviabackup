@@ -5,6 +5,43 @@ const { getConnection, sql } = require('../config/database');
 const { adminAuthenticate, requireFullAdmin } = require('../middleware/adminAuthenticate');
 require('dotenv').config();
 
+// System Logs fix (2026-07-27): successful WhatsApp alert campaigns never
+// wrote to system_logs, so the "WhatsApp Alerts Today" card on the System
+// Logs page was always stuck at 0 no matter how many Alert Clients sends
+// went out. One row per campaign (not per recipient) is written here,
+// mirroring how the Segment Control admin_logs entries summarize a single
+// admin action rather than flooding the log with one row per client.
+async function writeSystemLog(pool, logType, actor, actorType, details, status) {
+    try {
+        await pool.request()
+            .input('logType',   sql.VarChar(100),  logType)
+            .input('actor',     sql.VarChar(100),  actor     || null)
+            .input('actorType', sql.VarChar(20),   actorType || 'ADMIN')
+            .input('details',   sql.NVarChar(500), details   || null)
+            .input('status',    sql.VarChar(20),   status    || 'SUCCESS')
+            .query(`INSERT INTO system_logs (log_type,actor,actor_type,ucc,ip_address,details,status,created_at)
+                    VALUES (@logType,@actor,@actorType,NULL,NULL,@details,@status,GETDATE())`);
+    } catch (err) {
+        console.error('[SystemLog] adminControl write failed:', err.message);
+    }
+}
+
+// Segment Control (2026-07-25, terminal-first redesign): a segment's
+// is_enabled/terminals are now DERIVED from which terminals are switched on
+// and which exchange+segment combinations each one covers -- there is no
+// more manual per-segment Enable/Disable click or single-terminal dropdown.
+// XTS is added as a third terminal alongside the existing INHOUSE/BOW.
+const VALID_TERMINALS     = ['INHOUSE', 'BOW', 'XTS'];
+const VALID_EXCHANGES     = ['NSE', 'BSE', 'MCX'];
+const VALID_SEGMENT_TYPES = ['CM', 'FO'];
+// The 5 real (exchange, segment) rows that exist in segment_controls.
+// MCX has no Cash Market segment, so MCX+CM is intentionally absent here.
+const KNOWN_SEGMENTS = [
+    { exchange: 'NSE', segment: 'CM' }, { exchange: 'NSE', segment: 'FO' },
+    { exchange: 'BSE', segment: 'CM' }, { exchange: 'BSE', segment: 'FO' },
+    { exchange: 'MCX', segment: 'FO' },
+];
+
 function createTransporter() {
     return nodemailer.createTransport({
         host: process.env.SMTP_HOST || 'smtp.zatpatmail.com',
@@ -57,6 +94,114 @@ async function sendWhatsApp(mobile, clientName, ucc) {
     }
 }
 
+// Recomputes every known segment's is_enabled/terminals from the current
+// terminal_configs rows, and records enabled_at/enabled_by or
+// disabled_at/disabled_by + an admin_logs entry for any segment whose
+// computed status actually flipped. Called after every terminal config save.
+async function recomputeSegmentStatuses(pool, adminId) {
+    const tcResult = await pool.request().query(`SELECT terminal, is_enabled, exchanges, segments FROM terminal_configs`);
+    const terminalConfigs = tcResult.recordset;
+
+    for (const { exchange, segment } of KNOWN_SEGMENTS) {
+        const servingTerminals = terminalConfigs
+            .filter(tc => tc.is_enabled
+                && (tc.exchanges || '').split(',').map(v => v.trim()).includes(exchange)
+                && (tc.segments  || '').split(',').map(v => v.trim()).includes(segment))
+            .map(tc => tc.terminal);
+
+        const nowEnabled = servingTerminals.length > 0;
+        const termsStr    = servingTerminals.length > 0 ? servingTerminals.join(',') : null;
+
+        const current = await pool.request()
+            .input('exchange', sql.VarChar, exchange)
+            .input('segment',  sql.VarChar, segment)
+            .query(`SELECT is_enabled FROM segment_controls WHERE exchange = @exchange AND segment = @segment`);
+        const wasEnabled = !!current.recordset[0]?.is_enabled;
+
+        await pool.request()
+            .input('exchange',  sql.VarChar, exchange)
+            .input('segment',   sql.VarChar, segment)
+            .input('enabled',   sql.Bit, nowEnabled ? 1 : 0)
+            .input('adminId',   sql.Int, adminId)
+            .input('terminals', sql.VarChar(50), termsStr)
+            .query(`UPDATE segment_controls SET
+                    is_enabled  = @enabled,
+                    terminals   = @terminals,
+                    enabled_by  = CASE WHEN @enabled = 1 AND is_enabled = 0 THEN @adminId ELSE enabled_by  END,
+                    enabled_at  = CASE WHEN @enabled = 1 AND is_enabled = 0 THEN GETDATE() ELSE enabled_at  END,
+                    disabled_by = CASE WHEN @enabled = 0 AND is_enabled = 1 THEN @adminId ELSE disabled_by END,
+                    disabled_at = CASE WHEN @enabled = 0 AND is_enabled = 1 THEN GETDATE() ELSE disabled_at END
+                    WHERE exchange = @exchange AND segment = @segment`);
+
+        if (wasEnabled !== nowEnabled) {
+            await pool.request()
+                .input('adminId', sql.Int,     adminId)
+                .input('action',  sql.VarChar, nowEnabled ? 'SEGMENT_ENABLED' : 'SEGMENT_DISABLED')
+                .input('details', sql.VarChar, `${exchange} ${segment} ${nowEnabled ? 'enabled' : 'disabled'} (terminal config change, served by: ${termsStr || 'none'})`)
+                .query(`INSERT INTO admin_logs (admin_id, action, details) VALUES (@adminId, @action, @details)`);
+        }
+    }
+}
+
+// ── Real open-position lookup (2026-07-28) ────────────────────────────────────
+// Replaces the old static clients.<seg> flag (which only ever recorded which
+// segments a client is PROVISIONED for, not what they currently hold) and a
+// separate attempt that wrongly queried a disused generic `positions` table.
+// The actual live source of truth -- confirmed against DealerDashboard.jsx's
+// own Net-position merge (bfPos + dayPos, keyed by symbol+expiry+strike+
+// option_type, buy-sell summed across both sources) -- is two tables:
+//   - bf_positions: today's carried-forward qty (biz_date = today, IST)
+//   - day_positions: today's own trades (trade_date = today, IST)
+// FO: a client counts as "open" if the combined buy-sell across both sources
+// is non-zero for ANY contract (so a B/F position fully closed out by today's
+// trading is correctly excluded, same as the Net tab showing 0 for it).
+// CM (equity): Net/Square-off there is Day-only (no B/F carry-forward concept
+// for equity in this app), so it's just day_positions.net_qty != 0.
+async function getOpenPositionUccs(pool, exchange, segmentUpper) {
+    if (segmentUpper === 'FO') {
+        const result = await pool.request()
+            .input('exchange', sql.VarChar(10), exchange)
+            .query(`
+                WITH bf_contrib AS (
+                    SELECT ucc, symbol, expiry_date, strike_price, option_type,
+                        CASE WHEN ISNULL(opng_lng_qty,0) > 0 THEN opng_lng_qty
+                             WHEN ISNULL(total_open_qty,0) > 0 THEN total_open_qty ELSE 0 END AS buy_qty,
+                        CASE WHEN ISNULL(opng_shrt_qty,0) > 0 THEN opng_shrt_qty
+                             WHEN ISNULL(total_open_qty,0) < 0 THEN -total_open_qty ELSE 0 END AS sell_qty
+                    FROM bf_positions
+                    WHERE instrument_type IN ('OPTIONS','FUTURES')
+                      AND exchange = @exchange
+                      AND biz_date = CAST(DATEADD(MINUTE, 330, GETDATE()) AS DATE)
+                ),
+                day_contrib AS (
+                    SELECT ucc, symbol, expiry_date, strike_price, option_type,
+                           ISNULL(buy_qty,0) AS buy_qty, ISNULL(sell_qty,0) AS sell_qty
+                    FROM day_positions
+                    WHERE instrument_type IN ('OPTIONS','FUTURES')
+                      AND exchange = @exchange
+                      AND trade_date = CAST(DATEADD(MINUTE, 330, GETDATE()) AS DATE)
+                )
+                SELECT ucc
+                FROM (SELECT * FROM bf_contrib UNION ALL SELECT * FROM day_contrib) x
+                GROUP BY ucc, symbol, expiry_date, strike_price, option_type
+                HAVING SUM(buy_qty) - SUM(sell_qty) != 0
+            `);
+        return [...new Set(result.recordset.map(r => r.ucc))];
+    }
+
+    const result = await pool.request()
+        .input('exchange', sql.VarChar(10), exchange)
+        .query(`
+            SELECT DISTINCT ucc
+            FROM day_positions
+            WHERE instrument_type = 'EQUITY'
+              AND exchange = @exchange
+              AND trade_date = CAST(DATEADD(MINUTE, 330, GETDATE()) AS DATE)
+              AND net_qty != 0
+        `);
+    return result.recordset.map(r => r.ucc);
+}
+
 // ── Retry helper (2026-07-28) ──────────────────────────────────────────────────
 // Generic bounded retry for the two outbound sends below. Only retries on
 // failure (happy-path sends are completely unaffected -- no added latency),
@@ -96,18 +241,6 @@ async function sendWhatsAppWithRetry(mobile, clientName, ucc, { maxAttempts = 2,
 // `prior` = { emailOk: bool, waOk: bool } -- whether this UCC already has a
 // SUCCESS record for that channel since the current incident started (see
 // incident-anchor note on the /communicate route below).
-//
-// Returns one of five buckets matching the requested reporting shape
-// (selected / already_alerted / sent / failed / skipped are all rollups of
-// this per-client bucket, computed after channels are actually attempted):
-//   'ALREADY_ALERTED' -- every channel the admin asked for is already a
-//                        confirmed SUCCESS this incident; nothing to send.
-//   'UNREACHABLE'      -- no channel the admin asked for can be attempted
-//                        (no email/mobile on file, and no prior success
-//                        either) -- this is the "skipped" bucket.
-//   'NEEDS_WORK'        -- at least one requested channel still needs an
-//                        attempt this run (bucket resolves to sent/failed
-//                        only after the attempt is actually made).
 function classifyClient(client, prior, sendEmail, sendWhatsapp) {
     const p = prior || { emailOk: false, waOk: false };
 
@@ -119,10 +252,6 @@ function classifyClient(client, prior, sendEmail, sendWhatsapp) {
     const needEmail = emailHasContact && !p.emailOk;
     const needWa    = waHasContact    && !p.waOk;
 
-    // "already fully alerted" only applies to channels that were actually
-    // requested AND actually reachable -- a channel that was never requested,
-    // or that the client has no contact info for, doesn't count against them
-    // here (that's the UNREACHABLE bucket below, not ALREADY_ALERTED).
     const emailSatisfied = !emailHasContact || p.emailOk;
     const waSatisfied     = !waHasContact    || p.waOk;
 
@@ -153,11 +282,82 @@ router.get('/segments', adminAuthenticate, async (req, res) => {
     }
 });
 
+// ── GET /api/admin/control/terminals ──────────────────────────────────────────
+router.get('/terminals', adminAuthenticate, async (req, res) => {
+    try {
+        const pool   = await getConnection();
+        const result = await pool.request()
+            .query(`SELECT terminal, is_enabled, exchanges, segments, updated_at FROM terminal_configs ORDER BY terminal`);
+        return res.json({ success: true, terminals: result.recordset });
+    } catch (err) {
+        return res.status(500).json({ error: 'Could not fetch terminal configs.' });
+    }
+});
+
+// ── POST /api/admin/control/terminals/save ────────────────────────────────────
+// Saves ONE terminal's configuration (on/off + which exchanges + which
+// segments it covers), then recomputes every segment's Active/Inactive
+// status and served-by terminal list. Replaces the old per-segment
+// Enable/Disable + single-terminal-dropdown flow (POST /segments/toggle
+// below is left in place, unused, in case anything else still calls it).
+router.post('/terminals/save', adminAuthenticate, requireFullAdmin, async (req, res) => {
+    const { terminal, enabled, exchanges, segments } = req.body;
+    if (!terminal || !VALID_TERMINALS.includes(terminal.toUpperCase()))
+        return res.status(400).json({ error: 'Unknown terminal.' });
+
+    const exList  = Array.isArray(exchanges) ? exchanges.map(e => (e || '').toUpperCase()).filter(e => VALID_EXCHANGES.includes(e)) : [];
+    const segList = Array.isArray(segments)  ? segments.map(s => (s || '').toUpperCase()).filter(s => VALID_SEGMENT_TYPES.includes(s)) : [];
+
+    try {
+        const pool = await getConnection();
+        await pool.request()
+            .input('terminal',  sql.VarChar(10), terminal.toUpperCase())
+            .input('enabled',   sql.Bit,         enabled ? 1 : 0)
+            .input('exchanges', sql.VarChar(50), exList.length  ? exList.join(',')  : null)
+            .input('segments',  sql.VarChar(50), segList.length ? segList.join(',') : null)
+            .input('adminId',   sql.Int,         req.admin.adminId)
+            .query(`UPDATE terminal_configs SET
+                    is_enabled = @enabled,
+                    exchanges  = @exchanges,
+                    segments   = @segments,
+                    updated_by = @adminId,
+                    updated_at = GETDATE()
+                    WHERE terminal = @terminal`);
+
+        await recomputeSegmentStatuses(pool, req.admin.adminId);
+
+        await pool.request()
+            .input('adminId', sql.Int,     req.admin.adminId)
+            .input('action',  sql.VarChar, 'TERMINAL_CONFIG_SAVED')
+            .input('details', sql.VarChar, `${terminal.toUpperCase()} set to ${enabled ? 'ON' : 'OFF'} (exchanges: ${exList.join(',') || 'none'}, segments: ${segList.join(',') || 'none'})`)
+            .query(`INSERT INTO admin_logs (admin_id, action, details) VALUES (@adminId, @action, @details)`);
+
+        const [tcResult, segResult] = await Promise.all([
+            pool.request().query(`SELECT terminal, is_enabled, exchanges, segments, updated_at FROM terminal_configs ORDER BY terminal`),
+            pool.request().query(`SELECT sc.*, e.full_name as enabled_by_name, d.full_name as disabled_by_name
+                                   FROM segment_controls sc
+                                   LEFT JOIN admin_users e ON sc.enabled_by  = e.admin_id
+                                   LEFT JOIN admin_users d ON sc.disabled_by = d.admin_id
+                                   ORDER BY sc.exchange, sc.segment`)
+        ]);
+
+        return res.json({ success: true, terminals: tcResult.recordset, segments: segResult.recordset });
+    } catch (err) {
+        console.error('Terminal config save error:', err);
+        return res.status(500).json({ error: 'Failed to save terminal configuration.' });
+    }
+});
+
 // ── POST /api/admin/control/segments/toggle ───────────────────────────────────
+// Superseded by POST /terminals/save (terminal-first redesign, 2026-07-25).
+// Left in place unused rather than removed, in case anything else still
+// calls it -- it no longer has a caller in the admin UI.
 router.post('/segments/toggle', adminAuthenticate, requireFullAdmin, async (req, res) => {
-    const { exchange, segment, enable, notes } = req.body;
+    const { exchange, segment, enable, notes, terminal } = req.body;
     if (!exchange || !segment)
         return res.status(400).json({ error: 'Exchange and segment are required.' });
+    if (enable && !terminal)
+        return res.status(400).json({ error: 'Please select a terminal (INHOUSE or BOW) before enabling a segment.', code: 'TERMINAL_REQUIRED' });
     try {
         const pool = await getConnection();
         await pool.request()
@@ -166,13 +366,15 @@ router.post('/segments/toggle', adminAuthenticate, requireFullAdmin, async (req,
             .input('enable',   sql.Bit,     enable ? 1 : 0)
             .input('adminId',  sql.Int,     req.admin.adminId)
             .input('notes',    sql.VarChar, notes || '')
+            .input('terminal', sql.VarChar(10), terminal ? terminal.toUpperCase() : null)
             .query(`UPDATE segment_controls SET
                     is_enabled  = @enable,
                     enabled_by  = CASE WHEN @enable = 1 THEN @adminId ELSE enabled_by  END,
                     enabled_at  = CASE WHEN @enable = 1 THEN GETDATE() ELSE enabled_at  END,
                     disabled_by = CASE WHEN @enable = 0 THEN @adminId ELSE disabled_by END,
                     disabled_at = CASE WHEN @enable = 0 THEN GETDATE() ELSE disabled_at END,
-                    notes       = @notes
+                    notes       = @notes,
+                    terminal    = CASE WHEN @terminal IS NOT NULL THEN @terminal WHEN @enable = 0 THEN NULL ELSE terminal END
                     WHERE exchange = @exchange AND segment = @segment`);
         await pool.request()
             .input('adminId', sql.Int,     req.admin.adminId)
@@ -187,35 +389,48 @@ router.post('/segments/toggle', adminAuthenticate, requireFullAdmin, async (req,
 });
 
 // ── GET /api/admin/control/clients/:exchange/:segment ─────────────────────────
+// Rewired (2026-07-28) to the same real open-position source as /communicate
+// below, replacing the disused `positions` table join -- same bug, same fix,
+// kept consistent since both endpoints answer the identical question ("who
+// currently has an open position here").
 router.get('/clients/:exchange/:segment', adminAuthenticate, async (req, res) => {
     const { exchange, segment } = req.params;
+    const EX  = exchange.toUpperCase();
+    const SEG = segment.toUpperCase();
     try {
-        const pool   = await getConnection();
+        const pool = await getConnection();
+        const openUccs = await getOpenPositionUccs(pool, EX, SEG);
+        if (openUccs.length === 0)
+            return res.json({ success: true, clients: [], count: 0 });
+
         const result = await pool.request()
-            .input('exchange', sql.VarChar, exchange.toUpperCase())
-            .input('segment',  sql.VarChar, segment.toUpperCase())
+            .input('uccList', sql.VarChar(sql.MAX), openUccs.join(','))
             .query(`SELECT DISTINCT c.ucc, c.client_name, c.mobile, c.email
                     FROM clients c
-                    INNER JOIN positions p ON c.ucc = p.ucc
-                    WHERE p.exchange = @exchange
-                    AND   p.segment  = @segment
-                    AND   p.net_qty != 0
+                    WHERE c.ucc IN (SELECT value FROM STRING_SPLIT(@uccList, ','))
                     AND   c.is_active = 1
                     ORDER BY c.ucc`);
         return res.json({ success: true, clients: result.recordset, count: result.recordset.length });
     } catch (err) {
+        console.error('Clients-by-segment error:', err.message);
         return res.status(500).json({ error: 'Could not fetch clients.' });
     }
 });
 
 // ── POST /api/admin/control/communicate ──────────────────────────────────────
-// Redesigned (2026-07-28) per RMS request. Was: pull every client with a
-// static `clients.<seg>` flag set to 1, email+WhatsApp all of them, every
-// time, with no memory of who was already told. Now:
-//   1. Select from real open positions (net_qty != 0), not the static flag.
+// Redesigned (2026-07-28) per RMS request, corrected same day after finding
+// the first version was built against a stale codebase snapshot that
+// predated the terminal-first redesign (2026-07-25) and System Logs fix
+// (2026-07-27) -- both of those are fully preserved below (terminal_configs/
+// segment_controls.terminals filtering, and the ALERT_WHATSAPP_SENT
+// system_logs write). What changed from the previous static-flag version:
+//   1. Client selection now comes from real open positions (bf_positions +
+//      day_positions, the same two tables DealerDashboard.jsx's own Net-tab
+//      merge reads -- see getOpenPositionUccs above), not the static
+//      clients.<seg> provisioning flag and not the unrelated `positions`
+//      table an earlier attempt this session wrongly used.
 //   2. Dedupe -- a client can hold several open positions in the same
-//      exchange+segment (different symbols/expiries), which would otherwise
-//      join into multiple rows for one client.
+//      exchange+segment (different symbols/expiries), collapsed to one row.
 //   3. Check who's already been successfully notified for the *current*
 //      incident before sending again.
 //   4. Only send the channels that still need it.
@@ -233,10 +448,7 @@ router.get('/clients/:exchange/:segment', adminAuthenticate, async (req, res) =>
 // for it, i.e. the primary platform is confirmed down for that segment) --
 // falls back to the start of today if it's never been toggled, so the
 // already-alerted check always has a bound rather than matching every alert
-// ever sent historically. If "incident" should instead reset on disable, or
-// use a dedicated incident id, this is the one place to change (the
-// `incidentStart` lookup below) -- nothing else in this route depends on how
-// it's derived.
+// ever sent historically.
 router.post('/communicate', adminAuthenticate, requireFullAdmin, async (req, res) => {
     const { exchange, segment, send_email, send_whatsapp } = req.body;
     if (!exchange || !segment)
@@ -249,27 +461,45 @@ router.post('/communicate', adminAuthenticate, requireFullAdmin, async (req, res
     try {
         const pool = await getConnection();
 
-        // 1) Real open-position clients for this exchange/segment (same join
-        // already proven out by GET /clients/:exchange/:segment above) --
-        // replaces the old static clients.<seg> flag lookup.
-        const posResult = await pool.request()
+        // 1) Real open-position clients for this exchange/segment.
+        const openUccs = await getOpenPositionUccs(pool, EX, SEG);
+
+        if (openUccs.length === 0)
+            return res.json({
+                success: true, message: 'No clients found.',
+                total_clients: 0, selected: 0, already_alerted: 0,
+                sent: 0, failed: 0, skipped: 0,
+                emails_sent: 0, emails_failed: 0, whatsapp_sent: 0, whatsapp_failed: 0
+            });
+
+        // Preserve the terminal-serving filter from the terminal-first
+        // redesign -- a segment can now be served by more than one terminal
+        // at once; NULL/empty terminals means no terminal is currently
+        // serving it, so (matching the prior permissive fallback) every
+        // matching client is still notified rather than none.
+        const scRes = await pool.request()
             .input('exchange', sql.VarChar(10), EX)
             .input('segment',  sql.VarChar(10), SEG)
-            .query(`SELECT c.ucc, c.client_name, c.mobile, c.email
-                    FROM clients c
-                    INNER JOIN positions p ON c.ucc = p.ucc
-                    WHERE p.exchange = @exchange
-                    AND   p.segment  = @segment
-                    AND   p.net_qty != 0
-                    AND   c.is_active = 1
-                    AND   c.account_status = 'ACTIVE'`);
-        const rawRows = posResult.recordset;
+            .query(`SELECT terminals FROM segment_controls WHERE exchange = @exchange AND segment = @segment`);
+        const segTerminals = scRes.recordset[0]?.terminals || null;
 
-        // 2) Dedupe to one row per UCC (a client with 5 open F&O positions in
-        // this segment would otherwise appear as 5 identical rows here).
+        const clientResult = await pool.request()
+            .input('uccList',      sql.VarChar(sql.MAX), openUccs.join(','))
+            .input('segTerminals', sql.VarChar(50),      segTerminals)
+            .query(`SELECT ucc, client_name, mobile, email
+                    FROM clients
+                    WHERE ucc IN (SELECT value FROM STRING_SPLIT(@uccList, ','))
+                    AND is_active = 1
+                    AND account_status = 'ACTIVE'
+                    AND (@segTerminals IS NULL OR CHARINDEX(',' + terminal + ',', ',' + @segTerminals + ',') > 0)`);
+        const rawRows = clientResult.recordset;
+
+        // 2) Dedupe to one row per UCC (defensive -- getOpenPositionUccs
+        // already de-duplicates, and `clients` is naturally one row per
+        // UCC, so this should be a no-op in practice, kept for safety).
         const byUcc = new Map();
         rawRows.forEach(r => { if (!byUcc.has(r.ucc)) byUcc.set(r.ucc, r); });
-        const clients          = [...byUcc.values()];
+        const clients           = [...byUcc.values()];
         const duplicatesRemoved = rawRows.length - clients.length;
 
         if (clients.length === 0)
@@ -318,15 +548,12 @@ router.post('/communicate', adminAuthenticate, requireFullAdmin, async (req, res
             else                                        toProcess.push({ ...c, ...cls, prior: priorMap[c.ucc] || { emailOk: false, waOk: false } });
         });
 
-        // Recipients_count (2026-07-28, kept as-is on review): stays the whole
-        // selected open-position population, exactly as before this change --
-        // NOT narrowed to "clients actually attempted this run". ClientAlerts.jsx
-        // (Communication History page) sums this column straight into its
-        // "Total Clients Alerted" stat card and per-row "Recipients" figure, and
-        // never reads anything else new added by this fix -- keeping this field's
-        // meaning identical means that page requires zero changes and shows
-        // exactly the numbers it always has, on every run including repeat
-        // alerts for an already-partially-notified incident.
+        // Recipients_count stays the whole selected open-position population
+        // (matching what it always meant), NOT narrowed to clients actually
+        // attempted this run -- so the Communication History page
+        // ("ClientAlerts.jsx", which sums this column into its "Total
+        // Clients Alerted" stat and never reads any of the new fields below)
+        // requires zero changes and shows exactly the numbers it always has.
         const commResult = await pool.request()
             .input('adminId',  sql.Int,         req.admin.adminId)
             .input('exchange', sql.VarChar(10), EX)
@@ -489,6 +716,15 @@ router.post('/communicate', adminAuthenticate, requireFullAdmin, async (req, res
             // Only throttle when a network call actually happened -- no need
             // to sleep between clients we skipped without any outbound send.
             if (attemptedAny) await new Promise(resolve => setTimeout(resolve, 150));
+        }
+
+        // System Logs instrumentation (2026-07-27 fix, preserved) -- fires
+        // whenever at least one WhatsApp send succeeded this run, same
+        // trigger condition as before.
+        if (send_whatsapp && whatsappSent > 0) {
+            await writeSystemLog(pool, 'ALERT_WHATSAPP_SENT', String(req.admin.adminId), 'ADMIN',
+                `WhatsApp alert sent for ${EX} ${SEG} to ${whatsappSent} of ${clients.length} clients`,
+                'SUCCESS');
         }
 
         return res.json({
