@@ -36,6 +36,18 @@ function getInstrumentLabel(segment, optionType) {
     return 'Futures';
 }
 
+// Client-facing display fix (2026-07-28): for holdings/CM orders,
+// order.symbol is stored internally as "CompanyName ; ISIN" (see
+// Dashboard.jsx handleHoldingSquareOff / orders.js ISIN extraction) so it
+// can be matched/reconciled correctly elsewhere. The ISIN has no meaning to
+// a client reading their own trade confirmation, so it's stripped here for
+// DISPLAY ONLY -- this function never receives or mutates the underlying
+// order.symbol value, so every other consumer of order.symbol (matching,
+// dedup, is_stale computation, etc.) is completely unaffected.
+function stripIsinForDisplay(sym) {
+    return sym.split(';')[0].trim();
+}
+
 // Builds the complete NSE/BSE-style trading symbol
 // EQ:  WIPRO
 // FUT: PERSISTENT26JUNFUT
@@ -43,7 +55,7 @@ function getInstrumentLabel(segment, optionType) {
 function buildTradingSymbol(order) {
     const sym = (order.symbol || '').toUpperCase().trim();
     const seg = (order.segment || '').toUpperCase();
-    if (seg === 'CM') return sym;
+    if (seg === 'CM') return stripIsinForDisplay(sym);
 
     const exp = ddmmm(order.expiry_date);
     if (order.option_type && order.option_type !== 'XX') {
@@ -60,7 +72,7 @@ function buildTradingSymbol(order) {
 function buildTradingSymbolSpaced(order) {
     const sym = (order.symbol || '').toUpperCase().trim();
     const seg = (order.segment || '').toUpperCase();
-    if (seg === 'CM') return sym;
+    if (seg === 'CM') return stripIsinForDisplay(sym);
 
     const d   = order.expiry_date ? new Date(order.expiry_date) : null;
     const dd  = d ? String(d.getUTCDate()).padStart(2, '0') : '';
@@ -73,6 +85,33 @@ function buildTradingSymbolSpaced(order) {
         return [sym, expSpaced, strike, order.option_type].filter(Boolean).join(' ');
     }
     return [sym, expSpaced, 'FUT'].filter(Boolean).join(' ');
+}
+
+// WhatsApp trading-symbol fix (2026-07-28): the approved
+// navia_trade_confirmation_01 template param {2} needs the F&O symbol broken
+// into separate space-delimited words -- "NIFTY 28 JUL 25000 CE" instead of
+// buildTradingSymbol()'s concatenated "NIFTY28JUL25000CE" -- per the live
+// message samples reviewed. Kept as its own function rather than reusing
+// buildTradingSymbolSpaced() (email subject only) because that one also
+// includes the expiry year ("28 JUL 26"), which is not part of what was
+// requested/shown in the reference WhatsApp messages -- reusing it here
+// would silently add a year nobody asked for. CM/equity rows delegate
+// straight to buildTradingSymbol(), which already strips the ISIN above, so
+// WhatsApp and email both get the same ISIN-free holdings text.
+function buildTradingSymbolForWhatsApp(order) {
+    const seg = (order.segment || '').toUpperCase();
+    if (seg === 'CM') return buildTradingSymbol(order);
+
+    const sym = (order.symbol || '').toUpperCase().trim();
+    const d   = order.expiry_date ? new Date(order.expiry_date) : null;
+    const dd  = d ? String(d.getUTCDate()).padStart(2, '0') : '';
+    const mmm = d ? MONTHS[d.getUTCMonth()] : '';
+
+    if (order.option_type && order.option_type !== 'XX') {
+        const strike = order.strike_price ? Math.round(Number(order.strike_price)) : '';
+        return [sym, dd, mmm, strike, order.option_type].filter(Boolean).join(' ');
+    }
+    return [sym, dd, mmm, 'FUT'].filter(Boolean).join(' ');
 }
 
 function getSegmentLabel(segment, optionType) {
@@ -105,6 +144,7 @@ function buildNotificationContext(order, client, statusLabel) {
         instrumentType:  getInstrumentLabel(order.segment, order.option_type),
         tradingSymbol:       buildTradingSymbol(order),
         tradingSymbolSpaced: buildTradingSymbolSpaced(order),
+        tradingSymbolWA:     buildTradingSymbolForWhatsApp(order),
         side:            (order.side || '').toUpperCase(),
         executedQty:     order.executed_qty,
         requestedQty:    order.quantity,
@@ -204,7 +244,7 @@ async function sendTradeWhatsApp(client, order, statusLabel) {
     //    This is an automated confirmation from Navia Backup. Please contact
     //    support desk for any queries. Team Navia."
     // {1} = BUY / SELL
-    // {2} = Exchange + Scrip name with strike (e.g. "NSE NIFTY23JUN25550CE")
+    // {2} = Exchange + Scrip name with strike (e.g. "NSE NIFTY 23 JUN 25550 CE")
     // {3} = executed quantity
     // {4} = trade price (e.g. "299.90")
     const templateName = process.env.TRADE_CONFIRM_TEMPLATE_NAME || 'navia_trade_confirmation_01';
@@ -223,7 +263,7 @@ async function sendTradeWhatsApp(client, order, statusLabel) {
                 type: 'body',
                 parameters: [
                     { type: 'text', text: ctx.side },                                       // {1} BUY/SELL
-                    { type: 'text', text: `${ctx.exchange} ${ctx.tradingSymbol}` },         // {2} exchange + scrip
+                    { type: 'text', text: `${ctx.exchange} ${ctx.tradingSymbolWA}` },       // {2} exchange + scrip (spaced, ISIN-free for holdings)
                     { type: 'text', text: String(ctx.requestedQty) },                       // {3} qty placed by client (not recon-computed executedQty which can reflect total day position)
                     { type: 'text', text: ctx.tradePrice },                                 // {4} trade price
                 ]
