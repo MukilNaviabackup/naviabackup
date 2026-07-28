@@ -472,16 +472,31 @@ router.post('/communicate', adminAuthenticate, requireFullAdmin, async (req, res
                 emails_sent: 0, emails_failed: 0, whatsapp_sent: 0, whatsapp_failed: 0
             });
 
-        // Preserve the terminal-serving filter from the terminal-first
-        // redesign -- a segment can now be served by more than one terminal
-        // at once; NULL/empty terminals means no terminal is currently
-        // serving it, so (matching the prior permissive fallback) every
-        // matching client is still notified rather than none.
+        // Terminal-serving gate (2026-07-28 fix): the terminal-first redesign
+        // (2026-07-25) computed segment_controls.terminals but this route's
+        // fallback for "no terminal currently serving this segment" was to
+        // notify EVERYONE anyway (NULL segTerminals treated as "no filter").
+        // Confirmed via live testing (RMS, 2026-07-28): with every terminal
+        // switched off and every segment showing Inactive, clicking Alert
+        // Clients still sent real client communication -- that's backwards.
+        // No terminal enabled means Navia Backup isn't actually the live
+        // channel for anyone in this segment, so there is nothing to alert
+        // clients about; the admin needs to enable a terminal FIRST, and the
+        // UI should tell them that rather than silently sending. This request
+        // now hard-stops with a distinct error code the frontend can key a
+        // popup off of ("Please enable the terminal flag first").
         const scRes = await pool.request()
             .input('exchange', sql.VarChar(10), EX)
             .input('segment',  sql.VarChar(10), SEG)
             .query(`SELECT terminals FROM segment_controls WHERE exchange = @exchange AND segment = @segment`);
         const segTerminals = scRes.recordset[0]?.terminals || null;
+
+        if (!segTerminals) {
+            return res.status(400).json({
+                error: `No terminal is currently enabled for ${EX} ${SEG}. Enable a terminal (Inhouse/BoW/XTS) covering this exchange and segment in Configure Terminals before sending client alerts.`,
+                code: 'NO_TERMINAL_ENABLED'
+            });
+        }
 
         const clientResult = await pool.request()
             .input('uccList',      sql.VarChar(sql.MAX), openUccs.join(','))
