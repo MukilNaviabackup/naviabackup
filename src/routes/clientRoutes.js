@@ -73,22 +73,23 @@ function toBit(val) {
     return 0;
 }
 
-// ─── Accepts DD-MM-YYYY, YYYY-MM-DD, DD/MM/YYYY ──────────────────────────────
+// ─── DOB fix (2026-07-29): restricted to DD-MM-YYYY only ────────────────────
+// Previously also accepted DD/MM/YYYY and YYYY-MM-DD, which is ambiguous
+// against a 20,000+ row master file coming from an external source -- a
+// stray YYYY-MM-DD row could silently parse as a different date than
+// intended if the source system's convention differs. Now strictly
+// DD-MM-YYYY (hyphen-separated); anything else returns null, which the
+// upload loop already treats as a missing required field and skips the row
+// (visible in the returned `errors` array), so behaviour on bad input is
+// unchanged -- only the set of formats considered *valid* has narrowed.
 function toDate(val) {
     if (!val || val.trim() === '') return null;
     val = val.trim();
 
-    // DD-MM-YYYY or DD/MM/YYYY
-    if (/^\d{2}[-\/]\d{2}[-\/]\d{4}$/.test(val)) {
-        const sep = val.includes('-') ? '-' : '/';
-        const [d, m, y] = val.split(sep);
+    // DD-MM-YYYY only
+    if (/^\d{2}-\d{2}-\d{4}$/.test(val)) {
+        const [d, m, y] = val.split('-');
         const date = new Date(`${y}-${m}-${d}`);
-        return isNaN(date) ? null : date;
-    }
-
-    // YYYY-MM-DD
-    if (/^\d{4}-\d{2}-\d{2}$/.test(val)) {
-        const date = new Date(val);
         return isNaN(date) ? null : date;
     }
 
@@ -228,6 +229,23 @@ router.post('/upload', adminAuthenticate, upload.single('client_file'), async (r
             .input('action',  sql.VarChar, 'CLIENT_BULK_UPLOAD')
             .input('details', sql.VarChar, `${req.file?.originalname || 'file'} — ${inserted} inserted, ${updated} updated, ${skipped} skipped`)
             .query(`INSERT INTO admin_logs (admin_id, action, details) VALUES (@adminId, @action, @details)`);
+
+        // Upload history (2026-07-29): structured record of this run, feeding
+        // the new Client Upload history table on the frontend -- separate
+        // from the admin_logs entry above (which stays as-is for the
+        // existing Audit Logs page) so the filename/counts don't need to be
+        // parsed back out of a free-text details string.
+        await pool.request()
+            .input('filename',  sql.VarChar(255), req.file?.originalname || 'unknown.csv')
+            .input('adminId',   sql.Int,          req.admin.adminId)
+            .input('totalRows', sql.Int,          rows.length)
+            .input('inserted',  sql.Int,          inserted)
+            .input('updated',   sql.Int,          updated)
+            .input('skipped',   sql.Int,          skipped)
+            .query(`
+                INSERT INTO client_upload_history (filename, admin_id, total_rows, inserted, updated, skipped)
+                VALUES (@filename, @adminId, @totalRows, @inserted, @updated, @skipped)
+            `);
 
         console.log(`[Client Upload] ${inserted} inserted, ${updated} updated, ${skipped} skipped`);
         if (errors.length) console.warn('[Client Upload] Errors:', errors);
@@ -637,6 +655,47 @@ router.get('/search', adminAuthenticate, async (req, res) => {
     } catch (err) {
         console.error('[Client Search] Error:', err.message);
         return res.status(500).json({ error: 'Search failed: ' + err.message });
+    }
+});
+
+// ─── GET /api/admin/clients/upload-history ───────────────────────────────────
+// Client Upload history (2026-07-29): full history of CSV bulk-upload runs
+// -- filename, who ran it, when, and the resulting counts -- with an
+// optional ?from=YYYY-MM-DD&to=YYYY-MM-DD date-range filter. Both params are
+// optional and backward compatible; omitting either (or both) returns the
+// full unfiltered history newest-first, same pattern already used for
+// GET /api/admin/control/communications. `to` is inclusive of the whole day.
+router.get('/upload-history', adminAuthenticate, async (req, res) => {
+    try {
+        const pool    = await getConnection();
+        const request = pool.request();
+        const conditions = [];
+
+        if (req.query.from) {
+            request.input('fromDate', sql.Date, req.query.from);
+            conditions.push('h.uploaded_at >= @fromDate');
+        }
+        if (req.query.to) {
+            request.input('toDate', sql.Date, req.query.to);
+            conditions.push('h.uploaded_at < DATEADD(DAY, 1, @toDate)');
+        }
+
+        const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+        const result = await request.query(`
+            SELECT h.id, h.filename, h.uploaded_at,
+                   h.total_rows, h.inserted, h.updated, h.skipped,
+                   a.full_name AS uploaded_by
+            FROM client_upload_history h
+            LEFT JOIN admin_users a ON h.admin_id = a.admin_id
+            ${whereClause}
+            ORDER BY h.uploaded_at DESC
+        `);
+
+        return res.json({ success: true, history: result.recordset });
+    } catch (err) {
+        console.error('[Upload History] Error:', err.message);
+        return res.status(500).json({ error: 'Failed to fetch upload history.' });
     }
 });
 
