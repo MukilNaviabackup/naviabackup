@@ -51,6 +51,55 @@ function writeLog(logType, actor, actorType, ucc, ipAddress, details, status) {
     });
 }
 
+/* ── Account status gate (2026-07-29) ────────────────────────────────────────
+ * Client Account Status / Segment Status compliance requirement. Checked in
+ * ADDITION to the existing `is_active = 1` filter already present in every
+ * query below -- that filter is untouched, so any client who could log in
+ * before this change can still reach this check exactly as before. This gate
+ * only adds a new blocking layer for accounts whose account_status is now
+ * CLOSED or SUSPENDED (previously not checked at login at all).
+ *
+ * Returns null if the account may proceed (ACTIVE / REACTIVE, or status is
+ * somehow blank/unrecognised -- fails open to current behaviour rather than
+ * locking out a client over unexpected data), or a {status, body} object
+ * describing the HTTP response to send back if login must be blocked. */
+function checkAccountStatusGate(accountStatus) {
+    const status = (accountStatus || '').toString().trim().toUpperCase();
+
+    // NOTE (2026-07-29): the human-readable text lives in `error` (not
+    // `message`) deliberately -- every other error response in this file
+    // uses `{ error: '<readable text>' }`, and the frontend's existing
+    // fallback chain (`err.response?.data?.error || ... `) already reads
+    // that field first. Putting the message there means the Closed/
+    // Suspended text displays correctly even without any frontend change,
+    // via the exact same code path that already handles every other error.
+    // `errorCode` is a new, additional field the frontend can optionally
+    // key off of for a richer popup (e.g. the Dormant/reactivate modal).
+    if (status === 'CLOSED') {
+        return {
+            status: 403,
+            body: {
+                error:     'Your account is in closed status. We could not authorize your login.',
+                errorCode: 'ACCOUNT_CLOSED'
+            }
+        };
+    }
+
+    if (status === 'SUSPENDED') {
+        return {
+            status: 403,
+            body: {
+                error:         'Your account is in Dormant status. Please reactivate your account to continue.',
+                errorCode:     'ACCOUNT_SUSPENDED',
+                reactivateUrl: 'https://rekyc.navia.co.in/login.php'
+            }
+        };
+    }
+
+    // ACTIVE, REACTIVE, or blank/unrecognised -> allow (fail open).
+    return null;
+}
+
 /* ── Step 1: UCC + DOB → validate → send OTP ────────────────────────────────*/
 router.post('/login/initiate', async (req, res) => {
     const { ucc, dob } = req.body;
@@ -65,7 +114,7 @@ router.post('/login/initiate', async (req, res) => {
         const result = await pool.request()
             .input('ucc', sql.VarChar, ucc.toUpperCase().trim())
             .input('dob', sql.Date, dob)
-            .query(`SELECT client_id, mobile, email, client_name
+            .query(`SELECT client_id, mobile, email, client_name, account_status
                     FROM clients
                     WHERE ucc = @ucc AND dob = @dob AND is_active = 1`);
 
@@ -75,6 +124,15 @@ router.post('/login/initiate', async (req, res) => {
         }
 
         const client = result.recordset[0];
+
+        // Account status gate (2026-07-29) — checked before an OTP is ever
+        // sent, so a closed/suspended account never receives an OTP.
+        const gate = checkAccountStatusGate(client.account_status);
+        if (gate) {
+            writeLog('CLIENT_LOGIN_BLOCKED', client.client_name, 'CLIENT', ucc.toUpperCase(), ip,
+                `Login blocked at initiate — account_status=${client.account_status}`, 'FAILED');
+            return res.status(gate.status).json(gate.body);
+        }
 
         // Clean up stale OTP sessions
         await pool.request()
@@ -128,10 +186,20 @@ router.post('/login/verify-otp', async (req, res) => {
         const pool   = await getConnection();
         const result = await pool.request()
             .input('id', sql.Int, clientId)
-            .query(`SELECT ucc, client_name, mobile, email, dob
+            .query(`SELECT ucc, client_name, mobile, email, dob, account_status
                     FROM clients WHERE client_id = @id`);
 
         const client = result.recordset[0];
+
+        // Account status gate (2026-07-29) — re-checked here in addition to
+        // /login/initiate, as defense in depth in case an admin changes the
+        // account's status in the window between OTP send and OTP verify.
+        const gate = checkAccountStatusGate(client.account_status);
+        if (gate) {
+            writeLog('CLIENT_LOGIN_BLOCKED', client.client_name, 'CLIENT', client.ucc, ip,
+                `Login blocked at verify-otp — account_status=${client.account_status}`, 'FAILED');
+            return res.status(gate.status).json(gate.body);
+        }
 
         const token = jwt.sign(
             { clientId, ucc: client.ucc, name: client.client_name, mobile: client.mobile, email: client.email, loginType: 'OTP' },
@@ -195,7 +263,7 @@ router.post('/sso', async (req, res) => {
         const pool   = await getConnection();
         const result = await pool.request()
             .input('ucc', sql.VarChar, ucc.toUpperCase().trim())
-            .query(`SELECT client_id, client_name, mobile, email, ucc
+            .query(`SELECT client_id, client_name, mobile, email, ucc, account_status
                     FROM clients WHERE ucc = @ucc AND is_active = 1`);
 
         if (result.recordset.length === 0) {
@@ -203,6 +271,15 @@ router.post('/sso', async (req, res) => {
         }
 
         const client = result.recordset[0];
+
+        // Account status gate (2026-07-29) — SSO bypasses OTP entirely, so
+        // it needs the identical gate applied here.
+        const gate = checkAccountStatusGate(client.account_status);
+        if (gate) {
+            writeLog('CLIENT_LOGIN_BLOCKED', client.client_name, 'CLIENT', client.ucc, ip,
+                `SSO login blocked — account_status=${client.account_status}`, 'FAILED');
+            return res.status(gate.status).json(gate.body);
+        }
 
         const token = jwt.sign(
             { clientId: client.client_id, ucc: client.ucc, name: client.client_name, loginType: 'SSO' },

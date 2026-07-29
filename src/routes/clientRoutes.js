@@ -73,6 +73,57 @@ function toBit(val) {
     return 0;
 }
 
+// ─── Account/Segment status codes (2026-07-29) ───────────────────────────────
+// Client Account Status + Segment Status system. account_status on `clients`
+// is a DERIVED field -- it is recomputed from the client's rows in
+// client_segment_status every time a segment status changes, via
+// recomputeAccountStatus() below. It is not meant to be hand-set independent
+// of segment status except at initial client creation (defaults to ACTIVE)
+// or via direct bulk upload/BMS sync, which is why /create, /update, /upsert
+// and /upload below still accept an explicit account_status -- but now
+// validate it against this fixed set instead of accepting any string.
+//
+// Derivation rule (locked in with the client, 2026-07-29):
+//   - all segments CLOSED                       -> account CLOSED
+//   - all segments SUSPENDED                    -> account SUSPENDED
+//   - at least one segment ACTIVE               -> account ACTIVE
+//   - otherwise (mix of REACTIVE/CLOSED/SUSPENDED,
+//     no plain ACTIVE, not all Closed/Suspended) -> account REACTIVE
+const ALLOWED_ACCOUNT_STATUS = ['ACTIVE', 'SUSPENDED', 'CLOSED', 'REACTIVE'];
+const ALLOWED_SEGMENT_STATUS = ['ACTIVE', 'SUSPENDED', 'CLOSED', 'REACTIVE'];
+
+// Recompute clients.account_status from this client's client_segment_status
+// rows. Called after every segment-status write. Returns the new status, or
+// null if the client has no segment_status rows yet (leaves account_status
+// untouched in that case -- per client confirmation, this should not happen
+// in practice since every client already has segment rows).
+async function recomputeAccountStatus(pool, clientId) {
+    const segRes = await pool.request()
+        .input('clientId', sql.Int, clientId)
+        .query(`SELECT status FROM client_segment_status WHERE client_id = @clientId`);
+
+    const statuses = segRes.recordset.map(r => (r.status || '').toUpperCase());
+    if (statuses.length === 0) return null;
+
+    let newStatus;
+    if (statuses.every(s => s === 'CLOSED')) {
+        newStatus = 'CLOSED';
+    } else if (statuses.every(s => s === 'SUSPENDED')) {
+        newStatus = 'SUSPENDED';
+    } else if (statuses.some(s => s === 'ACTIVE')) {
+        newStatus = 'ACTIVE';
+    } else {
+        newStatus = 'REACTIVE';
+    }
+
+    await pool.request()
+        .input('clientId', sql.Int, clientId)
+        .input('status',   sql.VarChar(20), newStatus)
+        .query(`UPDATE clients SET account_status = @status WHERE client_id = @clientId`);
+
+    return newStatus;
+}
+
 // ─── DOB fix (2026-07-29): restricted to DD-MM-YYYY only ────────────────────
 // Previously also accepted DD/MM/YYYY and YYYY-MM-DD, which is ambiguous
 // against a 20,000+ row master file coming from an external source -- a
@@ -129,6 +180,20 @@ router.post('/upload', adminAuthenticate, upload.single('client_file'), async (r
                     continue;
                 }
 
+                // Account status code validation (2026-07-29): if the CSV
+                // supplies a value, it must be one of the fixed codes -- an
+                // unrecognised value (e.g. a typo) is rejected rather than
+                // silently stored as-is, since account_status now gates
+                // client login. Blank/absent still defaults to ACTIVE,
+                // matching prior behaviour exactly.
+                const accStatusRaw = row['account_status']?.trim().toUpperCase();
+                if (accStatusRaw && !ALLOWED_ACCOUNT_STATUS.includes(accStatusRaw)) {
+                    errors.push(`Skipped: ${ucc} — invalid account_status "${row['account_status']}" (must be ${ALLOWED_ACCOUNT_STATUS.join(', ')})`);
+                    skipped++;
+                    continue;
+                }
+                const accStatus = accStatusRaw || 'ACTIVE';
+
                 // Check if UCC already exists
                 const existing = await pool.request()
                     .input('ucc', sql.VarChar(20), ucc)
@@ -144,7 +209,7 @@ router.post('/upload', adminAuthenticate, upload.single('client_file'), async (r
                         .input('pan',        sql.VarChar(10),  row['pan']?.trim() || null)
                         .input('dpId',       sql.VarChar(20),  row['dp_id']?.trim() || null)
                         .input('boId',       sql.VarChar(20),  row['bo_id']?.trim() || null)
-                        .input('accStatus',  sql.VarChar(20),  row['account_status']?.trim() || 'ACTIVE')
+                        .input('accStatus',  sql.VarChar(20),  accStatus)
                         .input('nseCm',      sql.Bit,          toBit(row['nse_cm']))
                         .input('nseFo',      sql.Bit,          toBit(row['nse_fo']))
                         .input('nseCd',      sql.Bit,          toBit(row['nse_cd']))
@@ -184,7 +249,7 @@ router.post('/upload', adminAuthenticate, upload.single('client_file'), async (r
                         .input('pan',        sql.VarChar(10),  row['pan']?.trim() || null)
                         .input('dpId',       sql.VarChar(20),  row['dp_id']?.trim() || null)
                         .input('boId',       sql.VarChar(20),  row['bo_id']?.trim() || null)
-                        .input('accStatus',  sql.VarChar(20),  row['account_status']?.trim() || 'ACTIVE')
+                        .input('accStatus',  sql.VarChar(20),  accStatus)
                         .input('nseCm',      sql.Bit,          toBit(row['nse_cm']))
                         .input('nseFo',      sql.Bit,          toBit(row['nse_fo']))
                         .input('nseCd',      sql.Bit,          toBit(row['nse_cd']))
@@ -332,6 +397,16 @@ router.post('/create', async (req, res) => {
         });
     }
 
+    // Account status code validation (2026-07-29)
+    if (account_status !== undefined && account_status !== null && account_status.toString().trim() !== '') {
+        const accStatusCheck = account_status.toString().trim().toUpperCase();
+        if (!ALLOWED_ACCOUNT_STATUS.includes(accStatusCheck)) {
+            return res.status(400).json({
+                error: `Invalid account_status "${account_status}". Must be one of: ${ALLOWED_ACCOUNT_STATUS.join(', ')}`
+            });
+        }
+    }
+
     try {
         const pool = await getConnection();
 
@@ -356,7 +431,7 @@ router.post('/create', async (req, res) => {
             .input('pan',          sql.VarChar(10),  pan?.toString().trim() || null)
             .input('dpId',         sql.VarChar(20),  dp_id?.toString().trim() || null)
             .input('boId',         sql.VarChar(20),  bo_id?.toString().trim() || null)
-            .input('accStatus',    sql.VarChar(20),  account_status?.toString().trim() || 'ACTIVE')
+            .input('accStatus',    sql.VarChar(20),  account_status?.toString().trim().toUpperCase() || 'ACTIVE')
             .input('nseCm',        sql.Bit,          nse_cm  ? 1 : 0)
             .input('nseFo',        sql.Bit,          nse_fo  ? 1 : 0)
             .input('nseCd',        sql.Bit,          nse_cd  ? 1 : 0)
@@ -424,6 +499,16 @@ router.put('/update/:ucc', async (req, res) => {
         address, pincode, city, state, terminal
     } = req.body;
 
+    // Account status code validation (2026-07-29)
+    if (account_status !== undefined && account_status !== null && account_status.toString().trim() !== '') {
+        const accStatusCheck = account_status.toString().trim().toUpperCase();
+        if (!ALLOWED_ACCOUNT_STATUS.includes(accStatusCheck)) {
+            return res.status(400).json({
+                error: `Invalid account_status "${account_status}". Must be one of: ${ALLOWED_ACCOUNT_STATUS.join(', ')}`
+            });
+        }
+    }
+
     try {
         const pool = await getConnection();
 
@@ -449,7 +534,7 @@ router.put('/update/:ucc', async (req, res) => {
         if (pan          !== undefined) { updates.push('pan = @pan');                   request.input('pan',        sql.VarChar(10),  pan?.toString().trim() || null); }
         if (dp_id        !== undefined) { updates.push('dp_id = @dpId');               request.input('dpId',       sql.VarChar(20),  dp_id?.toString().trim() || null); }
         if (bo_id        !== undefined) { updates.push('bo_id = @boId');               request.input('boId',       sql.VarChar(20),  bo_id?.toString().trim() || null); }
-        if (account_status !== undefined) { updates.push('account_status = @accStatus'); request.input('accStatus',  sql.VarChar(20),  account_status?.toString().trim()); }
+        if (account_status !== undefined) { updates.push('account_status = @accStatus'); request.input('accStatus',  sql.VarChar(20),  account_status?.toString().trim().toUpperCase()); }
         if (is_active    !== undefined) { updates.push('is_active = @isActive');        request.input('isActive',   sql.Bit,          is_active ? 1 : 0); }
         if (nse_cm       !== undefined) { updates.push('nse_cm = @nseCm');             request.input('nseCm',      sql.Bit,          nse_cm  ? 1 : 0); }
         if (nse_fo       !== undefined) { updates.push('nse_fo = @nseFo');             request.input('nseFo',      sql.Bit,          nse_fo  ? 1 : 0); }
@@ -518,6 +603,16 @@ router.post('/upsert', async (req, res) => {
         });
     }
 
+    // Account status code validation (2026-07-29)
+    if (account_status !== undefined && account_status !== null && account_status.toString().trim() !== '') {
+        const accStatusCheck = account_status.toString().trim().toUpperCase();
+        if (!ALLOWED_ACCOUNT_STATUS.includes(accStatusCheck)) {
+            return res.status(400).json({
+                error: `Invalid account_status "${account_status}". Must be one of: ${ALLOWED_ACCOUNT_STATUS.join(', ')}`
+            });
+        }
+    }
+
     try {
         const pool     = await getConnection();
         const cleanUcc = ucc.toString().toUpperCase().trim();
@@ -537,7 +632,7 @@ router.post('/upsert', async (req, res) => {
             .input('pan',        sql.VarChar(10),  pan?.toString().trim() || null)
             .input('dpId',       sql.VarChar(20),  dp_id?.toString().trim() || null)
             .input('boId',       sql.VarChar(20),  bo_id?.toString().trim() || null)
-            .input('accStatus',  sql.VarChar(20),  account_status?.toString().trim() || 'ACTIVE')
+            .input('accStatus',  sql.VarChar(20),  account_status?.toString().trim().toUpperCase() || 'ACTIVE')
             .input('isActive',   sql.Bit,          is_active !== undefined ? (is_active ? 1 : 0) : 1)
             .input('nseCm',      sql.Bit,          nse_cm  ? 1 : 0)
             .input('nseFo',      sql.Bit,          nse_fo  ? 1 : 0)
@@ -699,14 +794,91 @@ router.get('/upload-history', adminAuthenticate, async (req, res) => {
     }
 });
 
+// ─── PUT /api/admin/clients/:ucc/segment-status ──────────────────────────────
+// Client Account/Segment Status system (2026-07-29): sets one exchange+segment
+// row's status for a client, then recomputes clients.account_status from the
+// full set of that client's segment rows (see recomputeAccountStatus above).
+// This is the first route that writes to client_segment_status -- previously
+// it was populated only by the original migration seed. Requires the row to
+// already exist for this client_id/exchange/segment (every client already has
+// segment rows per the migration, so this does not INSERT new rows).
+router.put('/:ucc/segment-status', adminAuthenticate, async (req, res) => {
+    try {
+        const ucc = req.params.ucc?.toUpperCase().trim();
+        const { exchange, segment, status } = req.body;
+
+        if (!ucc) return res.status(400).json({ error: 'UCC is required.' });
+        if (!exchange?.trim() || !segment?.trim() || !status?.trim()) {
+            return res.status(400).json({ error: 'exchange, segment, and status are all required.' });
+        }
+
+        const statusUpper = status.trim().toUpperCase();
+        if (!ALLOWED_SEGMENT_STATUS.includes(statusUpper)) {
+            return res.status(400).json({
+                error: `Invalid status "${status}". Must be one of: ${ALLOWED_SEGMENT_STATUS.join(', ')}`
+            });
+        }
+
+        const pool = await getConnection();
+
+        const clientRes = await pool.request()
+            .input('ucc', sql.VarChar(20), ucc)
+            .query('SELECT client_id FROM clients WHERE ucc = @ucc');
+
+        if (clientRes.recordset.length === 0) {
+            return res.status(404).json({ error: `Client with UCC ${ucc} not found.` });
+        }
+
+        const clientId = clientRes.recordset[0].client_id;
+
+        const updateResult = await pool.request()
+            .input('clientId',  sql.Int,          clientId)
+            .input('exchange',  sql.VarChar(10),  exchange.trim().toUpperCase())
+            .input('segment',   sql.VarChar(10),  segment.trim().toUpperCase())
+            .input('status',    sql.VarChar(20),  statusUpper)
+            .input('updatedBy', sql.VarChar(50),  req.admin.username || 'admin')
+            .query(`
+                UPDATE client_segment_status
+                SET status = @status, updated_at = GETDATE(), updated_by = @updatedBy
+                WHERE client_id = @clientId AND exchange = @exchange AND segment = @segment
+            `);
+
+        if (updateResult.rowsAffected[0] === 0) {
+            return res.status(404).json({
+                error: `No segment_status row found for ${ucc} — ${exchange.toUpperCase()}/${segment.toUpperCase()}.`
+            });
+        }
+
+        const newAccountStatus = await recomputeAccountStatus(pool, clientId);
+
+        // Audit log — same admin_logs table used elsewhere in this file
+        await pool.request()
+            .input('adminId', sql.Int,     req.admin.adminId)
+            .input('action',  sql.VarChar, 'CLIENT_SEGMENT_STATUS_CHANGE')
+            .input('details', sql.VarChar, `${ucc} — ${exchange.toUpperCase()}/${segment.toUpperCase()} set to ${statusUpper} — account_status now ${newAccountStatus}`)
+            .query(`INSERT INTO admin_logs (admin_id, action, details) VALUES (@adminId, @action, @details)`);
+
+        return res.json({
+            success:        true,
+            ucc,
+            exchange:       exchange.toUpperCase(),
+            segment:        segment.toUpperCase(),
+            status:         statusUpper,
+            account_status: newAccountStatus
+        });
+
+    } catch (err) {
+        console.error('[Segment Status] Error:', err.message);
+        return res.status(500).json({ error: 'Failed to update segment status: ' + err.message });
+    }
+});
+
 // ─── GET /api/admin/clients/:ucc/detail ──────────────────────────────────────
 // Client Search (2026-07-22): full client detail for the results-to-detail
 // drill-down, including the 4-state (Active/Reactive/Suspend/Closed) segment
-// status from the new client_segment_status table (see
-// client_segment_status.migration.sql). Display-only -- nothing here writes
-// to client_segment_status; that comes in a later round. Does not read or
-// touch the existing nse_cm/nse_fo/etc bit flags for anything other than
-// showing them alongside the new segment-status table for reference.
+// status from the client_segment_status table. Segment status can now be
+// changed via PUT /:ucc/segment-status above, which also recomputes
+// account_status -- this route remains read-only for display.
 router.get('/:ucc/detail', adminAuthenticate, async (req, res) => {
     try {
         const ucc = req.params.ucc?.toUpperCase().trim();
