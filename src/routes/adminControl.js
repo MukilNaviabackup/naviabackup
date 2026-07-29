@@ -56,18 +56,23 @@ async function sendWhatsApp(mobile, clientName, ucc) {
     try {
         const mobileClean = mobile.toString().replace(/\D/g, '');
         const waNumber = mobileClean.startsWith('91') ? mobileClean : `91${mobileClean}`;
+        // Template (2026-07-28): approved replacement for the old
+        // azure_navia_test_u placeholder template, after two rounds of
+        // rejection over OTP/login-flow content and numbered emoji
+        // formatting -- final approved body has exactly one placeholder,
+        // {{1}} = client name, and a static URL button (no runtime button
+        // parameter needed, since the button has no {{}} of its own).
         const waPayload = {
             messaging_product: 'whatsapp',
             to: waNumber,
             type: 'template',
             template: {
-                name: 'azure_navia_test_u',
+                name: 'new_navia_backup_022026',
                 language: { policy: 'deterministic', code: 'en' },
                 components: [{
                     type: 'body',
                     parameters: [
-                        { type: 'text', text: clientName || ucc },
-                        { type: 'text', text: ucc }
+                        { type: 'text', text: clientName || ucc }
                     ]
                 }]
             }
@@ -230,6 +235,22 @@ async function sendWhatsAppWithRetry(mobile, clientName, ucc, { maxAttempts = 2,
         if (attempt < maxAttempts) await new Promise(r => setTimeout(r, delayMs));
     }
     return last;
+}
+
+// STRING_SPLIT-free IN-clause builder (2026-07-28 fix): STRING_SPLIT requires
+// database compatibility level 130+ (SQL Server 2016+) -- if this Azure SQL
+// database is at an older compatibility level, both queries below would throw
+// immediately ("'STRING_SPLIT' is not a recognized built-in function name"),
+// which would surface to the admin as exactly "Communication failed." Binding
+// one parameter per UCC instead works on any compatibility level and carries
+// no injection risk (every value is a real bound parameter, never
+// interpolated into the query text).
+function buildUccInClause(request, uccList, paramPrefix) {
+    return uccList.map((u, i) => {
+        const p = `${paramPrefix}${i}`;
+        request.input(p, sql.VarChar(20), u);
+        return `@${p}`;
+    }).join(', ');
 }
 
 // ── Per-client channel classification (2026-07-28) ─────────────────────────────
@@ -403,11 +424,12 @@ router.get('/clients/:exchange/:segment', adminAuthenticate, async (req, res) =>
         if (openUccs.length === 0)
             return res.json({ success: true, clients: [], count: 0 });
 
-        const result = await pool.request()
-            .input('uccList', sql.VarChar(sql.MAX), openUccs.join(','))
+        const request  = pool.request();
+        const inClause = buildUccInClause(request, openUccs, 'ouc');
+        const result   = await request
             .query(`SELECT DISTINCT c.ucc, c.client_name, c.mobile, c.email
                     FROM clients c
-                    WHERE c.ucc IN (SELECT value FROM STRING_SPLIT(@uccList, ','))
+                    WHERE c.ucc IN (${inClause})
                     AND   c.is_active = 1
                     ORDER BY c.ucc`);
         return res.json({ success: true, clients: result.recordset, count: result.recordset.length });
@@ -498,12 +520,13 @@ router.post('/communicate', adminAuthenticate, requireFullAdmin, async (req, res
             });
         }
 
-        const clientResult = await pool.request()
-            .input('uccList',      sql.VarChar(sql.MAX), openUccs.join(','))
-            .input('segTerminals', sql.VarChar(50),      segTerminals)
+        const commClientRequest = pool.request();
+        const commInClause      = buildUccInClause(commClientRequest, openUccs, 'ouc');
+        const clientResult = await commClientRequest
+            .input('segTerminals', sql.VarChar(50), segTerminals)
             .query(`SELECT ucc, client_name, mobile, email
                     FROM clients
-                    WHERE ucc IN (SELECT value FROM STRING_SPLIT(@uccList, ','))
+                    WHERE ucc IN (${commInClause})
                     AND is_active = 1
                     AND account_status = 'ACTIVE'
                     AND (@segTerminals IS NULL OR CHARINDEX(',' + terminal + ',', ',' + @segTerminals + ',') > 0)`);
