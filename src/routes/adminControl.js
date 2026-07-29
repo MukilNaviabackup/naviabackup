@@ -873,14 +873,15 @@ router.get('/communications/:commId/recipients/view', async (req, res) => {
         const rows = result.recordset.map(r => {
             const emailSt = mapStatus(r.email_status);
             const waSt    = mapStatus(r.whatsapp_status);
-            const assignedOn = r.sent_at ? new Date(r.sent_at).toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—';
+            const triggeredOn = r.sent_at ? new Date(r.sent_at).toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—';
             return `<tr>
                 <td>${escapeHtml(r.mobile || '—')}</td>
                 <td>${escapeHtml(r.ucc)}</td>
-                <td>${assignedOn}</td>
+                <td>${escapeHtml(r.email || '—')}</td>
+                <td>${triggeredOn}</td>
                 <td><span class="pill" style="color:${emailSt.color};background:${emailSt.bg}">${emailSt.label}</span></td>
                 <td><span class="pill" style="color:${waSt.color};background:${waSt.bg}">${waSt.label}</span></td>
-                <td>${assignedOn}</td>
+                <td>${triggeredOn}</td>
             </tr>`;
         }).join('');
 
@@ -902,10 +903,10 @@ router.get('/communications/:commId/recipients/view', async (req, res) => {
 </style></head>
 <body>
   <h2>${escapeHtml(title)} — Recipients</h2>
-  <div class="sub">${result.recordset.length} client${result.recordset.length !== 1 ? 's' : ''} · "Assigned On" and "Updated On" both reflect the alert-triggered timestamp</div>
+  <div class="sub">${result.recordset.length} client${result.recordset.length !== 1 ? 's' : ''} · "Triggered Date and Time" and "Msg Delivered Date and Time to Client" currently show the same value -- actual delivery-confirmation timestamps aren't tracked yet, this is the send-attempt time</div>
   ${result.recordset.length === 0
       ? '<div class="empty">No recipients found for this alert.</div>'
-      : `<table><thead><tr><th>Mobile</th><th>Client Code</th><th>Assigned On</th><th>Email Status</th><th>WhatsApp Status</th><th>Updated On</th></tr></thead><tbody>${rows}</tbody></table>`}
+      : `<table><thead><tr><th>Mobile</th><th>Client Code</th><th>Email</th><th>Triggered Date and Time</th><th>Email Status</th><th>WhatsApp Status</th><th>Msg Delivered Date and Time to Client</th></tr></thead><tbody>${rows}</tbody></table>`}
 </body></html>`);
     } catch (err) {
         console.error('Recipients view error:', err);
