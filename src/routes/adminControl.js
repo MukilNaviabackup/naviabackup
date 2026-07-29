@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const nodemailer = require('nodemailer');
+const jwt = require('jsonwebtoken');
 const { getConnection, sql } = require('../config/database');
 const { adminAuthenticate, requireFullAdmin } = require('../middleware/adminAuthenticate');
 require('dotenv').config();
@@ -809,17 +810,142 @@ router.get('/communications/:commId/recipients', adminAuthenticate, async (req, 
     }
 });
 
-// ── GET /api/admin/control/communications ─────────────────────────────────────
-router.get('/communications', adminAuthenticate, async (req, res) => {
+// ── GET /api/admin/control/communications/:commId/recipients/view ────────────
+// Server-rendered HTML drill-down (2026-07-29), opened in a new browser tab
+// from the Recipients count on the Client Alerts page. A plain
+// window.open()/new-tab navigation can't carry a custom Authorization
+// header, so this route -- unlike every other route in this file -- reads
+// the admin JWT from ?token= and verifies it manually (same jwt.verify()
+// check adminAuthenticate does under the hood), rather than going through
+// the adminAuthenticate middleware. It returns HTML, not JSON; every other
+// route in this file is untouched.
+//
+// Columns: Mobile, Client Code, Assigned On, Email Status, WhatsApp Status,
+// Updated On. Per admin's own clarification "Assigned On" = the date/time
+// the alert was triggered to that client, which is communication_recipients
+// .sent_at -- the same column is also shown as "Updated On" since this table
+// has no separate last-modified timestamp; both columns will always show
+// the same value today. Status mapping (admin's call, not separately
+// confirmed): SUCCESS and ALREADY_ALERTED both display as "Success" (the
+// client did/does have a working alert on that channel), FAILED and
+// SKIPPED both display as "Fail" (no working alert exists yet).
+function mapStatus(raw) {
+    if (raw === 'SUCCESS' || raw === 'ALREADY_ALERTED') return { label: 'Success', color: '#15803d', bg: '#f0fdf4' };
+    return { label: 'Fail', color: '#dc2626', bg: '#fff5f5' };
+}
+
+function escapeHtml(str) {
+    return String(str ?? '').replace(/[&<>"']/g, ch => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[ch]));
+}
+
+router.get('/communications/:commId/recipients/view', async (req, res) => {
+    // Manual token verification (query param, not header) -- see comment above.
+    const token = req.query.token;
+    if (!token) return res.status(401).send('<h3>Access denied. No token provided.</h3>');
+    let decoded;
+    try {
+        decoded = jwt.verify(token, process.env.JWT_SECRET);
+        if (!decoded.adminId) throw new Error('not an admin token');
+    } catch (err) {
+        return res.status(401).send('<h3>Invalid or expired session. Please reopen this link from the Client Alerts page.</h3>');
+    }
+
     try {
         const pool   = await getConnection();
+        const commId = parseInt(req.params.commId);
+        if (!Number.isInteger(commId)) return res.status(400).send('<h3>Invalid communication id.</h3>');
+
+        const commResult = await pool.request()
+            .input('commId', sql.Int, commId)
+            .query(`SELECT exchange, segment, sent_at FROM communication_log WHERE comm_id = @commId`);
+        const comm = commResult.recordset[0];
+
         const result = await pool.request()
-            .query(`SELECT cl.*, a.full_name as sent_by
-                    FROM communication_log cl
-                    LEFT JOIN admin_users a ON cl.admin_id = a.admin_id
-                    ORDER BY cl.sent_at DESC`);
+            .input('commId', sql.Int, commId)
+            .query(`SELECT ucc, client_name, email, mobile,
+                           email_status, whatsapp_status, sent_at
+                    FROM communication_recipients
+                    WHERE comm_id = @commId
+                    ORDER BY ucc`);
+
+        const rows = result.recordset.map(r => {
+            const emailSt = mapStatus(r.email_status);
+            const waSt    = mapStatus(r.whatsapp_status);
+            const assignedOn = r.sent_at ? new Date(r.sent_at).toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—';
+            return `<tr>
+                <td>${escapeHtml(r.mobile || '—')}</td>
+                <td>${escapeHtml(r.ucc)}</td>
+                <td>${assignedOn}</td>
+                <td><span class="pill" style="color:${emailSt.color};background:${emailSt.bg}">${emailSt.label}</span></td>
+                <td><span class="pill" style="color:${waSt.color};background:${waSt.bg}">${waSt.label}</span></td>
+                <td>${assignedOn}</td>
+            </tr>`;
+        }).join('');
+
+        const title = comm ? `${comm.exchange || ''} ${comm.segment || ''} Alert #${commId}`.trim() : `Alert #${commId}`;
+
+        res.set('Content-Type', 'text/html');
+        return res.send(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>${escapeHtml(title)} — Recipients</title>
+<style>
+  body { font-family: 'DM Sans', -apple-system, sans-serif; background:#f8fafc; margin:0; padding:32px; color:#0f172a; }
+  h2 { font-size:16px; margin:0 0 4px; }
+  .sub { font-size:12px; color:#64748b; margin-bottom:20px; }
+  table { width:100%; border-collapse:collapse; background:#fff; border:0.5px solid #e2e8f0; border-radius:10px; overflow:hidden; }
+  th, td { text-align:left; padding:10px 16px; font-size:12px; border-bottom:0.5px solid #f1f5f9; }
+  th { background:#f8fafc; color:#64748b; text-transform:uppercase; font-size:10px; letter-spacing:0.4px; }
+  tr:last-child td { border-bottom:none; }
+  .pill { padding:2px 9px; border-radius:10px; font-size:11px; font-weight:600; }
+  .empty { padding:40px; text-align:center; color:#94a3b8; }
+</style></head>
+<body>
+  <h2>${escapeHtml(title)} — Recipients</h2>
+  <div class="sub">${result.recordset.length} client${result.recordset.length !== 1 ? 's' : ''} · "Assigned On" and "Updated On" both reflect the alert-triggered timestamp</div>
+  ${result.recordset.length === 0
+      ? '<div class="empty">No recipients found for this alert.</div>'
+      : `<table><thead><tr><th>Mobile</th><th>Client Code</th><th>Assigned On</th><th>Email Status</th><th>WhatsApp Status</th><th>Updated On</th></tr></thead><tbody>${rows}</tbody></table>`}
+</body></html>`);
+    } catch (err) {
+        console.error('Recipients view error:', err);
+        return res.status(500).send('<h3>Failed to load recipient details.</h3>');
+    }
+});
+
+// ── GET /api/admin/control/communications ─────────────────────────────────────
+// Date-range filter (2026-07-29): optional ?from=YYYY-MM-DD&to=YYYY-MM-DD.
+// Both are optional and backward compatible -- omitting either (or both)
+// falls back to the original unfiltered "everything, newest first" behaviour
+// so any other caller of this route is unaffected. `to` is treated as
+// inclusive of the whole day (up to 23:59:59.999) since sent_at is a
+// datetime, not just a date.
+router.get('/communications', adminAuthenticate, async (req, res) => {
+    try {
+        const pool    = await getConnection();
+        const request = pool.request();
+        const conditions = [];
+
+        if (req.query.from) {
+            request.input('fromDate', sql.Date, req.query.from);
+            conditions.push('cl.sent_at >= @fromDate');
+        }
+        if (req.query.to) {
+            request.input('toDate', sql.Date, req.query.to);
+            conditions.push('cl.sent_at < DATEADD(DAY, 1, @toDate)');
+        }
+
+        const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+        const result = await request.query(`
+            SELECT cl.*, a.full_name as sent_by
+            FROM communication_log cl
+            LEFT JOIN admin_users a ON cl.admin_id = a.admin_id
+            ${whereClause}
+            ORDER BY cl.sent_at DESC`);
         return res.json({ success: true, communications: result.recordset });
     } catch (err) {
+        console.error('Communications fetch error:', err);
         return res.status(500).json({ error: 'Could not fetch communications.' });
     }
 });
