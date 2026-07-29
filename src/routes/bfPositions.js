@@ -621,14 +621,37 @@ router.get('/status', adminAuthenticate, async (req, res) => {
 });
 
 // ─── GET /api/bf/history ──────────────────────────────────────────────────────
+// Full history + date-range filter (2026-07-29): previously hard-capped to
+// TOP 20 regardless of date. Every upload was already being permanently
+// stored in bf_upload_logs -- the cap was only in this SELECT -- so this now
+// returns the complete history for the requested range instead of an
+// arbitrary "last 20", filtered by an optional
+// ?from=YYYY-MM-DD&to=YYYY-MM-DD on the upload timestamp (created_at), same
+// pattern as the Client Alerts / Client Upload history date filters.
+// Omitting from/to returns the entire history, newest first.
 router.get('/history', adminAuthenticate, async (req, res) => {
     try {
-        const pool   = await getConnection();
-        const result = await pool.request().query(`
-            SELECT TOP 20
+        const pool    = await getConnection();
+        const request = pool.request();
+        const conditions = [];
+
+        if (req.query.from) {
+            request.input('fromDate', sql.Date, req.query.from);
+            conditions.push('created_at >= @fromDate');
+        }
+        if (req.query.to) {
+            request.input('toDate', sql.Date, req.query.to);
+            conditions.push('created_at < DATEADD(DAY, 1, @toDate)');
+        }
+
+        const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+        const result = await request.query(`
+            SELECT
                 log_id, filename, exchange, biz_date,
                 total_rows, inserted, skipped, uploaded_by, created_at
             FROM bf_upload_logs
+            ${whereClause}
             ORDER BY created_at DESC
         `);
         return res.json({ success: true, history: result.recordset });
