@@ -73,7 +73,7 @@ function toBit(val) {
     return 0;
 }
 
-// ─── Account/Segment status codes (2026-07-29) ───────────────────────────────
+// ─── Account/Segment status codes (2026-07-29, renumbered 2026-07-30) ────────
 // Client Account Status + Segment Status system. account_status on `clients`
 // is a DERIVED field -- it is recomputed from the client's rows in
 // client_segment_status every time a segment status changes, via
@@ -83,14 +83,34 @@ function toBit(val) {
 // and /upload below still accept an explicit account_status -- but now
 // validate it against this fixed set instead of accepting any string.
 //
-// Derivation rule (locked in with the client, 2026-07-29):
-//   - all segments CLOSED                       -> account CLOSED
-//   - all segments SUSPENDED                    -> account SUSPENDED
-//   - at least one segment ACTIVE               -> account ACTIVE
-//   - otherwise (mix of REACTIVE/CLOSED/SUSPENDED,
-//     no plain ACTIVE, not all Closed/Suspended) -> account REACTIVE
-const ALLOWED_ACCOUNT_STATUS = ['ACTIVE', 'SUSPENDED', 'CLOSED', 'REACTIVE'];
-const ALLOWED_SEGMENT_STATUS = ['ACTIVE', 'SUSPENDED', 'CLOSED', 'REACTIVE'];
+// Numeric codes (2026-07-30, per client request for easier identification).
+// Columns remain VARCHAR(20) -- no ALTER TABLE -- storing the digit as a
+// string ('1', '2', ...), not an integer, so no schema change was needed.
+// Segment and account scales are numbered independently; there is no
+// account-level REACTIVE (client's decision) -- a segment recomputing out of
+// SUSPENDED lands the account back on ACTIVE (1), same as a client who was
+// always active. Deliberately no code is 0, since `(value || '')`-style
+// checks already used elsewhere in this file and in auth.js would silently
+// treat 0 as blank/falsy in JavaScript -- avoiding 0 sidesteps that class of
+// bug entirely rather than requiring every truthy check to be hardened.
+const SEGMENT_STATUS_LABELS = { '1': 'ACTIVE', '2': 'REACTIVE', '3': 'SUSPENDED', '4': 'CLOSED' };
+const ACCOUNT_STATUS_LABELS = { '1': 'ACTIVE', '2': 'SUSPENDED', '3': 'CLOSED' };
+const ALLOWED_SEGMENT_STATUS = Object.keys(SEGMENT_STATUS_LABELS); // ['1','2','3','4']
+const ALLOWED_ACCOUNT_STATUS = Object.keys(ACCOUNT_STATUS_LABELS); // ['1','2','3']
+
+function describeAllowedStatus(labels) {
+    return Object.entries(labels).map(([code, name]) => `${code} (${name})`).join(', ');
+}
+
+const SEG_ACTIVE = '1', SEG_REACTIVE = '2', SEG_SUSPENDED = '3', SEG_CLOSED = '4';
+const ACC_ACTIVE = '1', ACC_SUSPENDED = '2', ACC_CLOSED = '3';
+
+// Derivation rule (locked in with the client, updated 2026-07-30):
+//   - all segments CLOSED (4)                    -> account CLOSED (3)
+//   - all segments SUSPENDED (3)                  -> account SUSPENDED (2)
+//   - otherwise (any ACTIVE, or a mix involving
+//     REACTIVE that isn't uniformly Closed/
+//     Suspended)                                  -> account ACTIVE (1)
 
 // Recompute clients.account_status from this client's client_segment_status
 // rows. Called after every segment-status write. Returns the new status, or
@@ -102,18 +122,16 @@ async function recomputeAccountStatus(pool, clientId) {
         .input('clientId', sql.Int, clientId)
         .query(`SELECT status FROM client_segment_status WHERE client_id = @clientId`);
 
-    const statuses = segRes.recordset.map(r => (r.status || '').toUpperCase());
+    const statuses = segRes.recordset.map(r => (r.status || '').toString().trim());
     if (statuses.length === 0) return null;
 
     let newStatus;
-    if (statuses.every(s => s === 'CLOSED')) {
-        newStatus = 'CLOSED';
-    } else if (statuses.every(s => s === 'SUSPENDED')) {
-        newStatus = 'SUSPENDED';
-    } else if (statuses.some(s => s === 'ACTIVE')) {
-        newStatus = 'ACTIVE';
+    if (statuses.every(s => s === SEG_CLOSED)) {
+        newStatus = ACC_CLOSED;
+    } else if (statuses.every(s => s === SEG_SUSPENDED)) {
+        newStatus = ACC_SUSPENDED;
     } else {
-        newStatus = 'REACTIVE';
+        newStatus = ACC_ACTIVE;
     }
 
     await pool.request()
@@ -180,19 +198,20 @@ router.post('/upload', adminAuthenticate, upload.single('client_file'), async (r
                     continue;
                 }
 
-                // Account status code validation (2026-07-29): if the CSV
-                // supplies a value, it must be one of the fixed codes -- an
-                // unrecognised value (e.g. a typo) is rejected rather than
-                // silently stored as-is, since account_status now gates
-                // client login. Blank/absent still defaults to ACTIVE,
-                // matching prior behaviour exactly.
-                const accStatusRaw = row['account_status']?.trim().toUpperCase();
+                // Account status code validation (2026-07-29, numeric codes
+                // 2026-07-30): if the CSV supplies a value, it must be one
+                // of the fixed numeric codes -- an unrecognised value (e.g.
+                // a typo, or a leftover string like "ACTIVE") is rejected
+                // rather than silently stored as-is, since account_status
+                // now gates client login. Blank/absent still defaults to
+                // ACTIVE (1), matching prior behaviour exactly.
+                const accStatusRaw = row['account_status']?.trim();
                 if (accStatusRaw && !ALLOWED_ACCOUNT_STATUS.includes(accStatusRaw)) {
-                    errors.push(`Skipped: ${ucc} — invalid account_status "${row['account_status']}" (must be ${ALLOWED_ACCOUNT_STATUS.join(', ')})`);
+                    errors.push(`Skipped: ${ucc} — invalid account_status "${row['account_status']}" (must be ${describeAllowedStatus(ACCOUNT_STATUS_LABELS)})`);
                     skipped++;
                     continue;
                 }
-                const accStatus = accStatusRaw || 'ACTIVE';
+                const accStatus = accStatusRaw || ACC_ACTIVE;
 
                 // Check if UCC already exists
                 const existing = await pool.request()
@@ -397,12 +416,12 @@ router.post('/create', async (req, res) => {
         });
     }
 
-    // Account status code validation (2026-07-29)
+    // Account status code validation (2026-07-29, numeric codes 2026-07-30)
     if (account_status !== undefined && account_status !== null && account_status.toString().trim() !== '') {
-        const accStatusCheck = account_status.toString().trim().toUpperCase();
+        const accStatusCheck = account_status.toString().trim();
         if (!ALLOWED_ACCOUNT_STATUS.includes(accStatusCheck)) {
             return res.status(400).json({
-                error: `Invalid account_status "${account_status}". Must be one of: ${ALLOWED_ACCOUNT_STATUS.join(', ')}`
+                error: `Invalid account_status "${account_status}". Must be one of: ${describeAllowedStatus(ACCOUNT_STATUS_LABELS)}`
             });
         }
     }
@@ -431,7 +450,7 @@ router.post('/create', async (req, res) => {
             .input('pan',          sql.VarChar(10),  pan?.toString().trim() || null)
             .input('dpId',         sql.VarChar(20),  dp_id?.toString().trim() || null)
             .input('boId',         sql.VarChar(20),  bo_id?.toString().trim() || null)
-            .input('accStatus',    sql.VarChar(20),  account_status?.toString().trim().toUpperCase() || 'ACTIVE')
+            .input('accStatus',    sql.VarChar(20),  account_status?.toString().trim() || ACC_ACTIVE)
             .input('nseCm',        sql.Bit,          nse_cm  ? 1 : 0)
             .input('nseFo',        sql.Bit,          nse_fo  ? 1 : 0)
             .input('nseCd',        sql.Bit,          nse_cd  ? 1 : 0)
@@ -499,12 +518,12 @@ router.put('/update/:ucc', async (req, res) => {
         address, pincode, city, state, terminal
     } = req.body;
 
-    // Account status code validation (2026-07-29)
+    // Account status code validation (2026-07-29, numeric codes 2026-07-30)
     if (account_status !== undefined && account_status !== null && account_status.toString().trim() !== '') {
-        const accStatusCheck = account_status.toString().trim().toUpperCase();
+        const accStatusCheck = account_status.toString().trim();
         if (!ALLOWED_ACCOUNT_STATUS.includes(accStatusCheck)) {
             return res.status(400).json({
-                error: `Invalid account_status "${account_status}". Must be one of: ${ALLOWED_ACCOUNT_STATUS.join(', ')}`
+                error: `Invalid account_status "${account_status}". Must be one of: ${describeAllowedStatus(ACCOUNT_STATUS_LABELS)}`
             });
         }
     }
@@ -534,7 +553,7 @@ router.put('/update/:ucc', async (req, res) => {
         if (pan          !== undefined) { updates.push('pan = @pan');                   request.input('pan',        sql.VarChar(10),  pan?.toString().trim() || null); }
         if (dp_id        !== undefined) { updates.push('dp_id = @dpId');               request.input('dpId',       sql.VarChar(20),  dp_id?.toString().trim() || null); }
         if (bo_id        !== undefined) { updates.push('bo_id = @boId');               request.input('boId',       sql.VarChar(20),  bo_id?.toString().trim() || null); }
-        if (account_status !== undefined) { updates.push('account_status = @accStatus'); request.input('accStatus',  sql.VarChar(20),  account_status?.toString().trim().toUpperCase()); }
+        if (account_status !== undefined) { updates.push('account_status = @accStatus'); request.input('accStatus',  sql.VarChar(20),  account_status?.toString().trim()); }
         if (is_active    !== undefined) { updates.push('is_active = @isActive');        request.input('isActive',   sql.Bit,          is_active ? 1 : 0); }
         if (nse_cm       !== undefined) { updates.push('nse_cm = @nseCm');             request.input('nseCm',      sql.Bit,          nse_cm  ? 1 : 0); }
         if (nse_fo       !== undefined) { updates.push('nse_fo = @nseFo');             request.input('nseFo',      sql.Bit,          nse_fo  ? 1 : 0); }
@@ -603,12 +622,12 @@ router.post('/upsert', async (req, res) => {
         });
     }
 
-    // Account status code validation (2026-07-29)
+    // Account status code validation (2026-07-29, numeric codes 2026-07-30)
     if (account_status !== undefined && account_status !== null && account_status.toString().trim() !== '') {
-        const accStatusCheck = account_status.toString().trim().toUpperCase();
+        const accStatusCheck = account_status.toString().trim();
         if (!ALLOWED_ACCOUNT_STATUS.includes(accStatusCheck)) {
             return res.status(400).json({
-                error: `Invalid account_status "${account_status}". Must be one of: ${ALLOWED_ACCOUNT_STATUS.join(', ')}`
+                error: `Invalid account_status "${account_status}". Must be one of: ${describeAllowedStatus(ACCOUNT_STATUS_LABELS)}`
             });
         }
     }
@@ -632,7 +651,7 @@ router.post('/upsert', async (req, res) => {
             .input('pan',        sql.VarChar(10),  pan?.toString().trim() || null)
             .input('dpId',       sql.VarChar(20),  dp_id?.toString().trim() || null)
             .input('boId',       sql.VarChar(20),  bo_id?.toString().trim() || null)
-            .input('accStatus',  sql.VarChar(20),  account_status?.toString().trim().toUpperCase() || 'ACTIVE')
+            .input('accStatus',  sql.VarChar(20),  account_status?.toString().trim() || ACC_ACTIVE)
             .input('isActive',   sql.Bit,          is_active !== undefined ? (is_active ? 1 : 0) : 1)
             .input('nseCm',      sql.Bit,          nse_cm  ? 1 : 0)
             .input('nseFo',      sql.Bit,          nse_fo  ? 1 : 0)
@@ -812,10 +831,10 @@ router.put('/:ucc/segment-status', adminAuthenticate, async (req, res) => {
             return res.status(400).json({ error: 'exchange, segment, and status are all required.' });
         }
 
-        const statusUpper = status.trim().toUpperCase();
-        if (!ALLOWED_SEGMENT_STATUS.includes(statusUpper)) {
+        const statusCode = status.toString().trim();
+        if (!ALLOWED_SEGMENT_STATUS.includes(statusCode)) {
             return res.status(400).json({
-                error: `Invalid status "${status}". Must be one of: ${ALLOWED_SEGMENT_STATUS.join(', ')}`
+                error: `Invalid status "${status}". Must be one of: ${describeAllowedStatus(SEGMENT_STATUS_LABELS)}`
             });
         }
 
@@ -835,7 +854,7 @@ router.put('/:ucc/segment-status', adminAuthenticate, async (req, res) => {
             .input('clientId',  sql.Int,          clientId)
             .input('exchange',  sql.VarChar(10),  exchange.trim().toUpperCase())
             .input('segment',   sql.VarChar(10),  segment.trim().toUpperCase())
-            .input('status',    sql.VarChar(20),  statusUpper)
+            .input('status',    sql.VarChar(20),  statusCode)
             .input('updatedBy', sql.VarChar(50),  req.admin.username || 'admin')
             .query(`
                 UPDATE client_segment_status
@@ -855,7 +874,7 @@ router.put('/:ucc/segment-status', adminAuthenticate, async (req, res) => {
         await pool.request()
             .input('adminId', sql.Int,     req.admin.adminId)
             .input('action',  sql.VarChar, 'CLIENT_SEGMENT_STATUS_CHANGE')
-            .input('details', sql.VarChar, `${ucc} — ${exchange.toUpperCase()}/${segment.toUpperCase()} set to ${statusUpper} — account_status now ${newAccountStatus}`)
+            .input('details', sql.VarChar, `${ucc} — ${exchange.toUpperCase()}/${segment.toUpperCase()} set to ${statusCode} — account_status now ${newAccountStatus}`)
             .query(`INSERT INTO admin_logs (admin_id, action, details) VALUES (@adminId, @action, @details)`);
 
         return res.json({
@@ -863,7 +882,7 @@ router.put('/:ucc/segment-status', adminAuthenticate, async (req, res) => {
             ucc,
             exchange:       exchange.toUpperCase(),
             segment:        segment.toUpperCase(),
-            status:         statusUpper,
+            status:         statusCode,
             account_status: newAccountStatus
         });
 

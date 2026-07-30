@@ -63,8 +63,14 @@ function writeLog(logType, actor, actorType, ucc, ipAddress, details, status) {
  * somehow blank/unrecognised -- fails open to current behaviour rather than
  * locking out a client over unexpected data), or a {status, body} object
  * describing the HTTP response to send back if login must be blocked. */
+// Account status codes (numeric, 2026-07-30): 1=ACTIVE, 2=SUSPENDED, 3=CLOSED.
+// Kept in sync with clientRoutes.js's ACCOUNT_STATUS_LABELS -- there's no
+// shared module between these two route files today, so the mapping is
+// duplicated here deliberately rather than silently drifting.
+const ACC_SUSPENDED = '2', ACC_CLOSED = '3';
+
 function checkAccountStatusGate(accountStatus) {
-    const status = (accountStatus || '').toString().trim().toUpperCase();
+    const status = (accountStatus || '').toString().trim();
 
     // NOTE (2026-07-29): the human-readable text lives in `error` (not
     // `message`) deliberately -- every other error response in this file
@@ -75,7 +81,7 @@ function checkAccountStatusGate(accountStatus) {
     // via the exact same code path that already handles every other error.
     // `errorCode` is a new, additional field the frontend can optionally
     // key off of for a richer popup (e.g. the Dormant/reactivate modal).
-    if (status === 'CLOSED') {
+    if (status === ACC_CLOSED) {
         return {
             status: 403,
             body: {
@@ -85,7 +91,7 @@ function checkAccountStatusGate(accountStatus) {
         };
     }
 
-    if (status === 'SUSPENDED') {
+    if (status === ACC_SUSPENDED) {
         return {
             status: 403,
             body: {
@@ -96,7 +102,9 @@ function checkAccountStatusGate(accountStatus) {
         };
     }
 
-    // ACTIVE, REACTIVE, or blank/unrecognised -> allow (fail open).
+    // ACTIVE (1), or blank/unrecognised -> allow (fail open). No code is 0,
+    // so the `(accountStatus || '')` truthy-coercion above can never
+    // mistake a real status value for "not set".
     return null;
 }
 
