@@ -821,7 +821,28 @@ router.get('/upload-history', adminAuthenticate, async (req, res) => {
 // it was populated only by the original migration seed. Requires the row to
 // already exist for this client_id/exchange/segment (every client already has
 // segment rows per the migration, so this does not INSERT new rows).
-router.put('/:ucc/segment-status', adminAuthenticate, async (req, res) => {
+// Auth (2026-07-30): this route now accepts EITHER a logged-in admin's JWT
+// (adminAuthenticate, for the admin dashboard) OR the BMS_API_KEY header
+// (matching /create, /update, /upsert), so the new headless Sharepro sync
+// service can call it directly without a human login session. Whichever
+// credential is presented, the rest of the route behaves identically --
+// req.admin.username is only used for the audit-log "updated_by" field, so
+// the API-key path fills in a fixed system label there instead.
+async function segmentStatusAuth(req, res, next) {
+    const apiKey = req.headers['x-api-key'];
+    if (apiKey) {
+        if (apiKey !== process.env.BMS_API_KEY) {
+            return res.status(401).json({ error: 'Unauthorized. Invalid API key.' });
+        }
+        req.admin = req.admin || {};
+        req.admin.username = req.admin.username || 'SHAREPRO_SYNC';
+        req.admin.adminId  = req.admin.adminId  || null;
+        return next();
+    }
+    return adminAuthenticate(req, res, next);
+}
+
+router.put('/:ucc/segment-status', segmentStatusAuth, async (req, res) => {
     try {
         const ucc = req.params.ucc?.toUpperCase().trim();
         const { exchange, segment, status } = req.body;
@@ -870,12 +891,22 @@ router.put('/:ucc/segment-status', adminAuthenticate, async (req, res) => {
 
         const newAccountStatus = await recomputeAccountStatus(pool, clientId);
 
-        // Audit log — same admin_logs table used elsewhere in this file
-        await pool.request()
-            .input('adminId', sql.Int,     req.admin.adminId)
-            .input('action',  sql.VarChar, 'CLIENT_SEGMENT_STATUS_CHANGE')
-            .input('details', sql.VarChar, `${ucc} — ${exchange.toUpperCase()}/${segment.toUpperCase()} set to ${statusCode} — account_status now ${newAccountStatus}`)
-            .query(`INSERT INTO admin_logs (admin_id, action, details) VALUES (@adminId, @action, @details)`);
+        // Audit log — same admin_logs table used elsewhere in this file.
+        // Wrapped defensively (2026-07-30): the API-key path above can leave
+        // req.admin.adminId as null (no human admin session), and this is
+        // the first admin_logs insert in this file that can happen with --
+        // if admin_logs.admin_id turns out to be NOT NULL / FK-constrained,
+        // this must not take down the segment-status update itself, which
+        // already succeeded by this point.
+        try {
+            await pool.request()
+                .input('adminId', sql.Int,     req.admin.adminId)
+                .input('action',  sql.VarChar, 'CLIENT_SEGMENT_STATUS_CHANGE')
+                .input('details', sql.VarChar, `${ucc} — ${exchange.toUpperCase()}/${segment.toUpperCase()} set to ${statusCode} — account_status now ${newAccountStatus}`)
+                .query(`INSERT INTO admin_logs (admin_id, action, details) VALUES (@adminId, @action, @details)`);
+        } catch (logErr) {
+            console.warn('[Segment Status] admin_logs insert failed (non-critical):', logErr.message);
+        }
 
         return res.json({
             success:        true,
