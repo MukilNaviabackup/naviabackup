@@ -142,10 +142,10 @@ async function recomputeAccountStatus(pool, clientId) {
     return newStatus;
 }
 
-// ─── Segment-status seeding for newly created clients (2026-07-31) ──────────
-// Exchange/segment -> boolField mapping on `clients`, matching the Sharepro
-// sync service's own CO_TO_SEGMENT mapping and the original migration's 7
-// tracked segments per client.
+// ─── Segment-status seeding for newly created clients (2026-07-31, revised same day per compliance) ──
+// Exchange/segment -> boolField mapping on `clients`. Still used to drive
+// the CSV bulk-upload path (see csvSegmentStatusList below), since that's
+// the only remaining caller that only has plain booleans to work with.
 const SEGMENT_BOOL_FIELDS = [
     { exchange: 'NSE', segment: 'CM', boolField: 'nse_cm' },
     { exchange: 'NSE', segment: 'FO', boolField: 'nse_fo' },
@@ -156,30 +156,56 @@ const SEGMENT_BOOL_FIELDS = [
     { exchange: 'MCX', segment: 'FO', boolField: 'mcx_fo' },
 ];
 
-// Seeds one client_segment_status row per tracked segment for a newly
-// created client, so later PUT /:ucc/segment-status calls (which only
-// UPDATE, never INSERT -- see that route's own comment below) always have a
-// row to match. Without this, any modify-triggered segment-status change for
-// a client created via /create, /upsert, or /upload would 404 with "No
-// segment_status row found" (confirmed 2026-07-31 via the Sharepro sync
-// service's ModifyData run, e.g. UCC 96505842). Status is derived from the
-// same boolean flags already supplied at creation: enabled (1) -> ACTIVE,
-// disabled (0) -> CLOSED, matching the sync service's own inverse
-// convention (statusCode === '4' ? 0 : 1).
-async function seedSegmentStatusRows(pool, clientId, flags, updatedBy) {
-    for (const seg of SEGMENT_BOOL_FIELDS) {
-        const enabled = !!flags[seg.boolField];
+// COMPLIANCE FIX (2026-07-31): the original version of this function seeded
+// all 7 tracked segments for every new client, defaulting anything not
+// explicitly enabled to CLOSED (4). That's wrong -- a segment the client was
+// NEVER registered for in Sharepro (no row at all) is not the same thing as
+// a segment that was active and got closed, and compliance requires we not
+// conflate the two. So this now ONLY seeds a row for a segment when the
+// caller explicitly supplies one (with its own real status code) -- any of
+// the 7 tracked segments not present in `segmentStatusList` simply gets NO
+// row at all. If the client activates that segment later, PUT
+// /:ucc/segment-status (below) now upserts, so the row gets created at that
+// point with the real ACTIVE status, instead of 404ing.
+async function seedSegmentStatusRows(pool, clientId, segmentStatusList, updatedBy) {
+    if (!Array.isArray(segmentStatusList)) return;
+    for (const seg of segmentStatusList) {
+        const exchange = (seg && seg.exchange || '').toString().trim().toUpperCase();
+        const segment  = (seg && seg.segment  || '').toString().trim().toUpperCase();
+        const status   = (seg && seg.status   || '').toString().trim();
+        // Skip anything malformed or carrying an unrecognised status code
+        // rather than guess -- same "never guess" rule used everywhere else
+        // in this system for unmapped values.
+        if (!exchange || !segment || !ALLOWED_SEGMENT_STATUS.includes(status)) continue;
         await pool.request()
             .input('clientId',  sql.Int,          clientId)
-            .input('exchange',  sql.VarChar(10),  seg.exchange)
-            .input('segment',   sql.VarChar(10),  seg.segment)
-            .input('status',    sql.VarChar(20),  enabled ? SEG_ACTIVE : SEG_CLOSED)
+            .input('exchange',  sql.VarChar(10),  exchange)
+            .input('segment',   sql.VarChar(10),  segment)
+            .input('status',    sql.VarChar(20),  status)
             .input('updatedBy', sql.VarChar(50),  updatedBy)
             .query(`
                 INSERT INTO client_segment_status (client_id, exchange, segment, status, updated_at, updated_by)
                 VALUES (@clientId, @exchange, @segment, @status, GETDATE(), @updatedBy)
             `);
     }
+}
+
+// CSV bulk-upload only has plain booleans (nse_cm=1/0, etc.), not real
+// per-segment status codes or a Sharepro row to check for existence. To
+// preserve the same never-registered-vs-closed distinction there: a BLANK
+// CSV cell means "not registered, skip entirely" (no row seeded); an
+// explicit "0" means CLOSED; an explicit "1" means ACTIVE. This only
+// affects which client_segment_status rows get seeded -- the `clients`
+// table's own boolean columns still use toBit()'s existing blank-is-0
+// behaviour unchanged.
+function csvSegmentStatusList(row) {
+    const list = [];
+    for (const seg of SEGMENT_BOOL_FIELDS) {
+        const raw = (row[seg.boolField] || '').toString().trim();
+        if (raw === '') continue; // blank -- never registered, skip
+        list.push({ exchange: seg.exchange, segment: seg.segment, status: toBit(raw) ? SEG_ACTIVE : SEG_CLOSED });
+    }
+    return list;
 }
 
 // ─── DOB fix (2026-07-29): restricted to DD-MM-YYYY only ────────────────────
@@ -342,12 +368,11 @@ router.post('/upload', adminAuthenticate, upload.single('client_file'), async (r
                         `);
                     const newClientId = insertResult.recordset[0].client_id;
                     // Seed client_segment_status rows for this new client
-                    // (2026-07-31) -- see seedSegmentStatusRows() above for why.
-                    await seedSegmentStatusRows(pool, newClientId, {
-                        nse_cm: toBit(row['nse_cm']), nse_fo: toBit(row['nse_fo']), nse_cd: toBit(row['nse_cd']),
-                        bse_cm: toBit(row['bse_cm']), bse_fo: toBit(row['bse_fo']), bse_cd: toBit(row['bse_cd']),
-                        mcx_fo: toBit(row['mcx_fo']),
-                    }, 'CLIENT_BULK_UPLOAD');
+                    // (2026-07-31, compliance revision same day) -- only for
+                    // segments whose CSV column was non-blank; see
+                    // csvSegmentStatusList() above for the blank-vs-0-vs-1
+                    // distinction.
+                    await seedSegmentStatusRows(pool, newClientId, csvSegmentStatusList(row), 'CLIENT_BULK_UPLOAD');
                     inserted++;
                 }
             } catch (rowErr) {
@@ -455,7 +480,17 @@ router.post('/create', async (req, res) => {
         pan, dp_id, bo_id, account_status,
         nse_cm, nse_fo, nse_cd,
         bse_cm, bse_fo, bse_cd, mcx_fo,
-        address, pincode, city, state, terminal
+        address, pincode, city, state, terminal,
+        // Compliance fix (2026-07-31): explicit per-segment status list,
+        // one entry per segment Sharepro actually has a row for --
+        // {exchange, segment, status}. Segments the client was never
+        // registered for are simply absent from this array (not sent with
+        // any boolean), so no client_segment_status row gets created for
+        // them at all -- see seedSegmentStatusRows() above. Defaults to []
+        // so older callers that don't send this field still work exactly as
+        // before (no segment rows seeded, same as if every segment were
+        // absent).
+        segment_status,
     } = req.body;
 
     // Required field validation
@@ -535,12 +570,12 @@ router.post('/create', async (req, res) => {
 
         const clientId = result.recordset[0].client_id;
 
-        // Seed client_segment_status rows for this new client (2026-07-31)
-        // -- see seedSegmentStatusRows() above for why this is required
-        // before any later PUT /:ucc/segment-status call can succeed.
-        await seedSegmentStatusRows(pool, clientId, {
-            nse_cm, nse_fo, nse_cd, bse_cm, bse_fo, bse_cd, mcx_fo
-        }, 'SHAREPRO_SYNC');
+        // Seed client_segment_status rows for this new client (2026-07-31,
+        // compliance revision same day) -- ONLY for the segments explicitly
+        // listed in segment_status (i.e. segments Sharepro actually has a
+        // row for). Any of the 7 tracked segments not in that list gets NO
+        // row -- see seedSegmentStatusRows() above.
+        await seedSegmentStatusRows(pool, clientId, segment_status, 'SHAREPRO_SYNC');
 
         console.log(`[Client Create] New client: ${ucc} (ID: ${clientId})`);
 
@@ -670,7 +705,10 @@ router.post('/upsert', async (req, res) => {
         pan, dp_id, bo_id, account_status, is_active,
         nse_cm, nse_fo, nse_cd,
         bse_cm, bse_fo, bse_cd, mcx_fo,
-        address, pincode, city, state, terminal
+        address, pincode, city, state, terminal,
+        // Compliance fix (2026-07-31) -- see /create above for the full
+        // explanation. Only used on the isNew (insert) branch below.
+        segment_status,
     } = req.body;
 
     if (!ucc || !dob || !mobile || !email || !client_name) {
@@ -763,10 +801,10 @@ router.post('/upsert', async (req, res) => {
         if (isNew) {
             const newClientId = mergeResult.recordset[0].client_id;
             // Seed client_segment_status rows for this new client
-            // (2026-07-31) -- see seedSegmentStatusRows() above for why.
-            await seedSegmentStatusRows(pool, newClientId, {
-                nse_cm, nse_fo, nse_cd, bse_cm, bse_fo, bse_cd, mcx_fo
-            }, 'SHAREPRO_SYNC');
+            // (2026-07-31, compliance revision same day) -- only for
+            // segments explicitly present in segment_status; see
+            // seedSegmentStatusRows() above.
+            await seedSegmentStatusRows(pool, newClientId, segment_status, 'SHAREPRO_SYNC');
         }
 
         console.log(`[Client Upsert] ${isNew ? 'Created' : 'Updated'}: ${cleanUcc}`);
@@ -888,8 +926,16 @@ router.get('/upload-history', adminAuthenticate, async (req, res) => {
 // This is the first route that writes to client_segment_status -- previously
 // it was populated only by the original migration seed, and (as of 2026-07-31)
 // also by seedSegmentStatusRows() at client-creation time in /create, /upsert,
-// and /upload above. Requires the row to already exist for this
-// client_id/exchange/segment -- this route only ever UPDATEs, never INSERTs.
+// and /upload above.
+// UPSERT (2026-07-31, compliance revision same day): this route used to only
+// ever UPDATE, 404ing with "No segment_status row found" if the row didn't
+// exist. That's no longer just a bug workaround -- it's now the *expected*
+// path for a segment the client was legitimately never registered for in
+// Sharepro (seedSegmentStatusRows() deliberately does not create a row for
+// those, per compliance: absent != closed). So when the client later
+// activates that segment for the first time, this route must be able to
+// create the row rather than fail -- it now checks for existence first and
+// INSERTs if missing, else UPDATEs.
 // Auth (2026-07-30): this route now accepts EITHER a logged-in admin's JWT
 // (adminAuthenticate, for the admin dashboard) OR the BMS_API_KEY header
 // (matching /create, /update, /upsert), so the new headless Sharepro sync
@@ -939,23 +985,43 @@ router.put('/:ucc/segment-status', segmentStatusAuth, async (req, res) => {
         }
 
         const clientId = clientRes.recordset[0].client_id;
+        const exch     = exchange.trim().toUpperCase();
+        const seg      = segment.trim().toUpperCase();
+        const updatedBy = req.admin.username || 'admin';
 
-        const updateResult = await pool.request()
-            .input('clientId',  sql.Int,          clientId)
-            .input('exchange',  sql.VarChar(10),  exchange.trim().toUpperCase())
-            .input('segment',   sql.VarChar(10),  segment.trim().toUpperCase())
-            .input('status',    sql.VarChar(20),  statusCode)
-            .input('updatedBy', sql.VarChar(50),  req.admin.username || 'admin')
-            .query(`
-                UPDATE client_segment_status
-                SET status = @status, updated_at = GETDATE(), updated_by = @updatedBy
-                WHERE client_id = @clientId AND exchange = @exchange AND segment = @segment
-            `);
+        // Upsert (2026-07-31): check existence first rather than assuming
+        // the row is already there -- see the route comment above for why a
+        // missing row is now an expected, valid case (first-ever activation
+        // of a segment that was never registered in Sharepro).
+        const existingSegRes = await pool.request()
+            .input('clientId', sql.Int,         clientId)
+            .input('exchange', sql.VarChar(10), exch)
+            .input('segment',  sql.VarChar(10), seg)
+            .query(`SELECT 1 FROM client_segment_status WHERE client_id = @clientId AND exchange = @exchange AND segment = @segment`);
 
-        if (updateResult.rowsAffected[0] === 0) {
-            return res.status(404).json({
-                error: `No segment_status row found for ${ucc} — ${exchange.toUpperCase()}/${segment.toUpperCase()}.`
-            });
+        if (existingSegRes.recordset.length > 0) {
+            await pool.request()
+                .input('clientId',  sql.Int,          clientId)
+                .input('exchange',  sql.VarChar(10),  exch)
+                .input('segment',   sql.VarChar(10),  seg)
+                .input('status',    sql.VarChar(20),  statusCode)
+                .input('updatedBy', sql.VarChar(50),  updatedBy)
+                .query(`
+                    UPDATE client_segment_status
+                    SET status = @status, updated_at = GETDATE(), updated_by = @updatedBy
+                    WHERE client_id = @clientId AND exchange = @exchange AND segment = @segment
+                `);
+        } else {
+            await pool.request()
+                .input('clientId',  sql.Int,          clientId)
+                .input('exchange',  sql.VarChar(10),  exch)
+                .input('segment',   sql.VarChar(10),  seg)
+                .input('status',    sql.VarChar(20),  statusCode)
+                .input('updatedBy', sql.VarChar(50),  updatedBy)
+                .query(`
+                    INSERT INTO client_segment_status (client_id, exchange, segment, status, updated_at, updated_by)
+                    VALUES (@clientId, @exchange, @segment, @status, GETDATE(), @updatedBy)
+                `);
         }
 
         const newAccountStatus = await recomputeAccountStatus(pool, clientId);
