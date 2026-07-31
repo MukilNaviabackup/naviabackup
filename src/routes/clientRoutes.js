@@ -48,7 +48,7 @@ function parseCSVLine(line) {
 function parseCSV(filePath) {
     const content = fs.readFileSync(filePath, 'utf8')
         .replace(/^﻿/, '')       // Remove BOM
-        .replace(/ /g, ' ')      // Replace non-breaking spaces
+        .replace(/ /g, ' ')      // Replace non-breaking spaces
         .replace(/\r\n/g, '\n')       // Normalize line endings
         .replace(/\r/g, '\n');
 
@@ -61,7 +61,7 @@ function parseCSV(filePath) {
         const vals = parseCSVLine(lines[i]);
         const row  = {};
         headers.forEach((h, idx) => {
-            row[h] = (vals[idx] || '').trim().replace(/ /g, ' ');
+            row[h] = (vals[idx] || '').trim().replace(/ /g, ' ');
         });
         rows.push(row);
     }
@@ -142,6 +142,46 @@ async function recomputeAccountStatus(pool, clientId) {
     return newStatus;
 }
 
+// ─── Segment-status seeding for newly created clients (2026-07-31) ──────────
+// Exchange/segment -> boolField mapping on `clients`, matching the Sharepro
+// sync service's own CO_TO_SEGMENT mapping and the original migration's 7
+// tracked segments per client.
+const SEGMENT_BOOL_FIELDS = [
+    { exchange: 'NSE', segment: 'CM', boolField: 'nse_cm' },
+    { exchange: 'NSE', segment: 'FO', boolField: 'nse_fo' },
+    { exchange: 'NSE', segment: 'CD', boolField: 'nse_cd' },
+    { exchange: 'BSE', segment: 'CM', boolField: 'bse_cm' },
+    { exchange: 'BSE', segment: 'FO', boolField: 'bse_fo' },
+    { exchange: 'BSE', segment: 'CD', boolField: 'bse_cd' },
+    { exchange: 'MCX', segment: 'FO', boolField: 'mcx_fo' },
+];
+
+// Seeds one client_segment_status row per tracked segment for a newly
+// created client, so later PUT /:ucc/segment-status calls (which only
+// UPDATE, never INSERT -- see that route's own comment below) always have a
+// row to match. Without this, any modify-triggered segment-status change for
+// a client created via /create, /upsert, or /upload would 404 with "No
+// segment_status row found" (confirmed 2026-07-31 via the Sharepro sync
+// service's ModifyData run, e.g. UCC 96505842). Status is derived from the
+// same boolean flags already supplied at creation: enabled (1) -> ACTIVE,
+// disabled (0) -> CLOSED, matching the sync service's own inverse
+// convention (statusCode === '4' ? 0 : 1).
+async function seedSegmentStatusRows(pool, clientId, flags, updatedBy) {
+    for (const seg of SEGMENT_BOOL_FIELDS) {
+        const enabled = !!flags[seg.boolField];
+        await pool.request()
+            .input('clientId',  sql.Int,          clientId)
+            .input('exchange',  sql.VarChar(10),  seg.exchange)
+            .input('segment',   sql.VarChar(10),  seg.segment)
+            .input('status',    sql.VarChar(20),  enabled ? SEG_ACTIVE : SEG_CLOSED)
+            .input('updatedBy', sql.VarChar(50),  updatedBy)
+            .query(`
+                INSERT INTO client_segment_status (client_id, exchange, segment, status, updated_at, updated_by)
+                VALUES (@clientId, @exchange, @segment, @status, GETDATE(), @updatedBy)
+            `);
+    }
+}
+
 // ─── DOB fix (2026-07-29): restricted to DD-MM-YYYY only ────────────────────
 // Previously also accepted DD/MM/YYYY and YYYY-MM-DD, which is ambiguous
 // against a 20,000+ row master file coming from an external source -- a
@@ -188,9 +228,9 @@ router.post('/upload', adminAuthenticate, upload.single('client_file'), async (r
 
         for (const row of rows) {
             try {
-                const ucc  = row['ucc']?.toUpperCase().trim().replace(/ /g, '');
+                const ucc  = row['ucc']?.toUpperCase().trim().replace(/ /g, '');
                 const dob  = toDate(row['dob']);
-                const name = row['client_name']?.trim().replace(/ /g, '');
+                const name = row['client_name']?.trim().replace(/ /g, '');
 
                 if (!ucc || !dob || !name || !row['mobile']?.trim() || !row['email']?.trim()) {
                     errors.push(`Skipped: ${ucc || 'unknown'} — missing required field (dob: ${row['dob']}, name: ${name})`);
@@ -259,7 +299,7 @@ router.post('/upload', adminAuthenticate, upload.single('client_file'), async (r
                         `);
                     updated++;
                 } else {
-                    await pool.request()
+                    const insertResult = await pool.request()
                         .input('ucc',        sql.VarChar(20),  ucc)
                         .input('dob',        sql.Date,         dob)
                         .input('mobile',     sql.VarChar(15),  row['mobile']?.trim())
@@ -289,7 +329,9 @@ router.post('/upload', adminAuthenticate, upload.single('client_file'), async (r
                                 bse_cm, bse_fo, bse_cd, mcx_fo,
                                 address, pincode, city, state, terminal,
                                 is_active, last_synced_at
-                            ) VALUES (
+                            )
+                            OUTPUT INSERTED.client_id
+                            VALUES (
                                 @ucc, @dob, @mobile, @email, @clientName,
                                 @pan, @dpId, @boId, @accStatus,
                                 @nseCm, @nseFo, @nseCd,
@@ -298,6 +340,14 @@ router.post('/upload', adminAuthenticate, upload.single('client_file'), async (r
                                 1, GETDATE()
                             )
                         `);
+                    const newClientId = insertResult.recordset[0].client_id;
+                    // Seed client_segment_status rows for this new client
+                    // (2026-07-31) -- see seedSegmentStatusRows() above for why.
+                    await seedSegmentStatusRows(pool, newClientId, {
+                        nse_cm: toBit(row['nse_cm']), nse_fo: toBit(row['nse_fo']), nse_cd: toBit(row['nse_cd']),
+                        bse_cm: toBit(row['bse_cm']), bse_fo: toBit(row['bse_fo']), bse_cd: toBit(row['bse_cd']),
+                        mcx_fo: toBit(row['mcx_fo']),
+                    }, 'CLIENT_BULK_UPLOAD');
                     inserted++;
                 }
             } catch (rowErr) {
@@ -484,6 +534,14 @@ router.post('/create', async (req, res) => {
             `);
 
         const clientId = result.recordset[0].client_id;
+
+        // Seed client_segment_status rows for this new client (2026-07-31)
+        // -- see seedSegmentStatusRows() above for why this is required
+        // before any later PUT /:ucc/segment-status call can succeed.
+        await seedSegmentStatusRows(pool, clientId, {
+            nse_cm, nse_fo, nse_cd, bse_cm, bse_fo, bse_cd, mcx_fo
+        }, 'SHAREPRO_SYNC');
+
         console.log(`[Client Create] New client: ${ucc} (ID: ${clientId})`);
 
         return res.status(201).json({
@@ -642,7 +700,7 @@ router.post('/upsert', async (req, res) => {
 
         const isNew = existing.recordset.length === 0;
 
-        await pool.request()
+        const mergeResult = await pool.request()
             .input('ucc',        sql.VarChar(20),  cleanUcc)
             .input('dob',        sql.Date,          new Date(dob))
             .input('mobile',     sql.VarChar(15),  mobile?.toString().trim())
@@ -698,8 +756,18 @@ router.post('/upsert', async (req, res) => {
                         @bseCm, @bseFo, @bseCd, @mcxFo,
                         @address, @pincode, @city, @state, @terminal,
                         GETDATE()
-                    );
+                    )
+                OUTPUT inserted.client_id;
             `);
+
+        if (isNew) {
+            const newClientId = mergeResult.recordset[0].client_id;
+            // Seed client_segment_status rows for this new client
+            // (2026-07-31) -- see seedSegmentStatusRows() above for why.
+            await seedSegmentStatusRows(pool, newClientId, {
+                nse_cm, nse_fo, nse_cd, bse_cm, bse_fo, bse_cd, mcx_fo
+            }, 'SHAREPRO_SYNC');
+        }
 
         console.log(`[Client Upsert] ${isNew ? 'Created' : 'Updated'}: ${cleanUcc}`);
 
@@ -818,9 +886,10 @@ router.get('/upload-history', adminAuthenticate, async (req, res) => {
 // row's status for a client, then recomputes clients.account_status from the
 // full set of that client's segment rows (see recomputeAccountStatus above).
 // This is the first route that writes to client_segment_status -- previously
-// it was populated only by the original migration seed. Requires the row to
-// already exist for this client_id/exchange/segment (every client already has
-// segment rows per the migration, so this does not INSERT new rows).
+// it was populated only by the original migration seed, and (as of 2026-07-31)
+// also by seedSegmentStatusRows() at client-creation time in /create, /upsert,
+// and /upload above. Requires the row to already exist for this
+// client_id/exchange/segment -- this route only ever UPDATEs, never INSERTs.
 // Auth (2026-07-30): this route now accepts EITHER a logged-in admin's JWT
 // (adminAuthenticate, for the admin dashboard) OR the BMS_API_KEY header
 // (matching /create, /update, /upsert), so the new headless Sharepro sync
