@@ -1,0 +1,77 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Navia Backup â€” SSO Test URL Generator</title>
+<style>
+  body { font-family: -apple-system, 'Segoe UI', sans-serif; max-width: 640px; margin: 40px auto; padding: 0 20px; color: #1e293b; }
+  h1 { font-size: 18px; margin-bottom: 4px; }
+  p.sub { color: #64748b; font-size: 13px; margin-top: 0; margin-bottom: 24px; }
+  label { display: block; font-size: 12px; font-weight: 600; color: #475569; margin-bottom: 6px; margin-top: 16px; }
+  input { width: 100%; box-sizing: border-box; padding: 10px 12px; font-size: 14px; border: 1px solid #cbd5e1; border-radius: 6px; }
+  button { margin-top: 20px; background: #2563eb; color: #fff; border: none; padding: 10px 20px; font-size: 14px; font-weight: 600; border-radius: 6px; cursor: pointer; }
+  button:hover { background: #1d4ed8; }
+  #result { margin-top: 24px; padding: 16px; background: #f1f5f9; border-radius: 8px; font-size: 13px; word-break: break-all; display: none; }
+  #result a { color: #2563eb; font-weight: 600; }
+  .warn { color: #b91c1c; font-weight: 600; }
+  .ok { color: #15803d; font-weight: 600; }
+  .note { font-size: 11px; color: #94a3b8; margin-top: 4px; }
+</style>
+</head>
+<body>
+
+<h1>Navia Backup â€” SSO Test URL Generator</h1>
+<p class="sub">Paste the secret once, then just change the UCC and click Generate for each new test. Nothing here is sent anywhere â€” the signature is computed entirely in your browser.</p>
+
+<label for="secret">SSO_SECRET (from Azure Configuration)</label>
+<input type="password" id="secret" placeholder="Paste the secret here" autocomplete="off">
+<div class="note">Stays on this page only, in this browser tab â€” never sent anywhere.</div>
+
+<label for="ucc">UCC to test</label>
+<input type="text" id="ucc" placeholder="e.g. 97917850" autocomplete="off">
+
+<button onclick="generate()">Generate Test URL</button>
+
+<div id="result"></div>
+
+<script>
+async function hmacSha256Hex(secret, message) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw', enc.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false, ['sign']
+  );
+  const sigBuffer = await crypto.subtle.sign('HMAC', key, enc.encode(message));
+  return Array.from(new Uint8Array(sigBuffer))
+    .map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function generate() {
+  const secret = document.getElementById('secret').value.trim();
+  const ucc = document.getElementById('ucc').value.trim();
+  const resultDiv = document.getElementById('result');
+  resultDiv.style.display = 'block';
+
+  if (!secret || !ucc) {
+    resultDiv.innerHTML = '<span class="warn">Please fill in both the secret and the UCC.</span>';
+    return;
+  }
+  if (secret.length !== 64) {
+    resultDiv.innerHTML = '<span class="warn">Warning: secret is ' + secret.length + ' characters long, expected 64. Double-check you copied the full value.</span>';
+    return;
+  }
+
+  const ts = Date.now();
+  const sig = await hmacSha256Hex(secret, ucc + '|' + ts);
+  const url = 'https://backup.navia.co.in/api/auth/sso?ucc=' + encodeURIComponent(ucc) + '&ts=' + ts + '&sig=' + sig;
+
+  resultDiv.innerHTML =
+    '<span class="ok">Secret length OK (64 chars).</span><br><br>' +
+    'Test URL (valid ~5 minutes):<br>' +
+    '<a href="' + url + '" target="_blank">' + url + '</a>';
+}
+</script>
+
+</body>
+</html>
