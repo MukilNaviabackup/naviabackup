@@ -359,7 +359,7 @@ router.post('/client-data', async (req, res) => {
         const clientResult = await pool.request()
             .input('ucc', sql.VarChar(20), ucc.trim())
             .query(`SELECT ucc, client_name, mobile, email,
-                           nse_cm, nse_fo, bse_cm, bse_fo, mcx_fo
+                           nse_cm, nse_fo, bse_cm, bse_fo, mcx_fo, terminal
                     FROM clients WHERE ucc = @ucc AND is_active = 1`);
 
         if (clientResult.recordset.length === 0) {
