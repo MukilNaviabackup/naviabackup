@@ -1,6 +1,7 @@
 const express = require('express');
 const router  = express.Router();
 const jwt     = require('jsonwebtoken');
+const crypto  = require('crypto');
 const { getConnection, sql } = require('../config/database');
 const { generateAndSendOTP, verifyOTP } = require('../services/otpService');
 require('dotenv').config();
@@ -303,6 +304,146 @@ router.post('/sso', async (req, res) => {
     } catch (err) {
         console.error('SSO login error:', err);
         return res.status(500).json({ error: 'SSO login failed.' });
+    }
+});
+
+/* ── Trading-app SSO handoff (2026-08-03) ────────────────────────────────────
+ * Entry point for the "Tools -> Navia Backup" hop from the main trading
+ * application. The trading app redirects the client's own BROWSER (not a
+ * server-to-server call) to:
+ *
+ *   GET /api/auth/sso?ucc=<UCC>&ts=<unix_ms>&sig=<hex_hmac>
+ *
+ * where sig = HMAC-SHA256(SSO_SECRET, `${ucc}|${ts}`), hex-encoded.
+ *
+ * This is deliberately separate from the older POST /sso above (that one
+ * is untouched -- kept in case anything already depends on it -- but its
+ * "hash" was just base64(ucc:secret) with no expiry, so it is NOT what the
+ * external trading-app integration should use).
+ *
+ * Flow on success: verify signature -> verify link is fresh (<=5 min old)
+ * -> verify link hasn't been used before (sso_tokens UNIQUE(sig)) -> apply
+ * the SAME account-status gate as every other login path -> issue the SAME
+ * shape of JWT the OTP flow issues -> 302 redirect the browser into the
+ * frontend with that token. Everything downstream (positions, square-off's
+ * segment_controls.is_enabled check, etc.) is completely unchanged -- it
+ * only ever looks at the JWT, never at how the session was created.
+ *
+ * On any failure, redirects back to the normal login page with a friendly
+ * error rather than showing raw JSON (since this is a browser redirect,
+ * not an API call from JS -- a JSON error page would look broken).
+ */
+const SSO_TOKEN_MAX_AGE_MS   = 5 * 60 * 1000;   // 5 minutes -- generous enough that normal redirect/network delay never fails it, short enough to bound replay risk
+const SSO_CLOCK_SKEW_MS      = 30 * 1000;       // small allowance for the trading app's clock running slightly ahead of ours
+const FRONTEND_BASE_URL      = process.env.FRONTEND_BASE_URL || 'https://backup.navia.co.in';
+
+function timingSafeEqualHex(a, b) {
+    try {
+        const bufA = Buffer.from(a, 'hex');
+        const bufB = Buffer.from(b, 'hex');
+        if (bufA.length !== bufB.length) return false;
+        return crypto.timingSafeEqual(bufA, bufB);
+    } catch {
+        return false;
+    }
+}
+
+router.get('/sso', async (req, res) => {
+    const { ucc, ts, sig } = req.query;
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || null;
+
+    const failToLogin = (errorCode) =>
+        res.redirect(`${FRONTEND_BASE_URL}/login?ssoError=${encodeURIComponent(errorCode)}`);
+
+    if (!ucc || !ts || !sig) {
+        writeLog('CLIENT_LOGIN_FAILED', ucc || null, 'CLIENT', ucc || null, ip, 'SSO link missing ucc/ts/sig', 'FAILED');
+        return failToLogin('MISSING_PARAMS');
+    }
+
+    const tsNum = Number(ts);
+    if (!Number.isFinite(tsNum)) {
+        return failToLogin('BAD_TIMESTAMP');
+    }
+
+    const ageMs = Date.now() - tsNum;
+    if (ageMs > SSO_TOKEN_MAX_AGE_MS || ageMs < -SSO_CLOCK_SKEW_MS) {
+        writeLog('CLIENT_LOGIN_FAILED', ucc, 'CLIENT', ucc, ip, `SSO link expired or not yet valid (age=${ageMs}ms)`, 'FAILED');
+        return failToLogin('LINK_EXPIRED');
+    }
+
+    if (!process.env.SSO_SECRET) {
+        console.error('[SSO] SSO_SECRET is not configured on this server.');
+        return failToLogin('SERVER_NOT_CONFIGURED');
+    }
+
+    const expectedSig = crypto
+        .createHmac('sha256', process.env.SSO_SECRET)
+        .update(`${ucc}|${ts}`)
+        .digest('hex');
+
+    if (!timingSafeEqualHex(sig, expectedSig)) {
+        writeLog('CLIENT_LOGIN_FAILED', ucc, 'CLIENT', ucc, ip, 'SSO signature mismatch', 'FAILED');
+        return failToLogin('BAD_SIGNATURE');
+    }
+
+    try {
+        const pool = await getConnection();
+
+        // Single-use enforcement: sig has a UNIQUE constraint, so a repeat
+        // attempt with the exact same link fails this insert with a
+        // duplicate-key error, which we treat as "already used."
+        try {
+            await pool.request()
+                .input('ucc', sql.VarChar(20), ucc.toUpperCase().trim())
+                .input('ts',  sql.BigInt,      tsNum)
+                .input('sig', sql.VarChar(64), sig)
+                .query(`INSERT INTO sso_tokens (ucc, ts, sig) VALUES (@ucc, @ts, @sig)`);
+        } catch (dupErr) {
+            writeLog('CLIENT_LOGIN_FAILED', ucc, 'CLIENT', ucc, ip, 'SSO link already used (replay attempt)', 'FAILED');
+            return failToLogin('LINK_ALREADY_USED');
+        }
+
+        const result = await pool.request()
+            .input('ucc', sql.VarChar, ucc.toUpperCase().trim())
+            .query(`SELECT client_id, client_name, mobile, email, ucc, account_status
+                    FROM clients WHERE ucc = @ucc AND is_active = 1`);
+
+        if (result.recordset.length === 0) {
+            writeLog('CLIENT_LOGIN_FAILED', ucc, 'CLIENT', ucc, ip, 'SSO: UCC not found', 'FAILED');
+            return failToLogin('CLIENT_NOT_FOUND');
+        }
+
+        const client = result.recordset[0];
+
+        // Same account-status gate every other login path uses.
+        const gate = checkAccountStatusGate(client.account_status);
+        if (gate) {
+            writeLog('CLIENT_LOGIN_BLOCKED', client.client_name, 'CLIENT', client.ucc, ip,
+                `SSO login blocked — account_status=${client.account_status}`, 'FAILED');
+            return failToLogin(gate.body.errorCode || 'ACCOUNT_BLOCKED');
+        }
+
+        const token = jwt.sign(
+            { clientId: client.client_id, ucc: client.ucc, name: client.client_name, mobile: client.mobile, email: client.email, loginType: 'SSO' },
+            process.env.JWT_SECRET,
+            { expiresIn: '8h' }
+        );
+
+        writeLog('CLIENT_LOGIN_SUCCESS', client.client_name, 'CLIENT', client.ucc, ip,
+            `Client ${client.ucc} SSO login via Tools redirect`, 'SUCCESS');
+
+        const params = new URLSearchParams({
+            token,
+            ucc:    client.ucc,
+            name:   client.client_name || '',
+            mobile: client.mobile || '',
+            email:  client.email || ''
+        });
+        return res.redirect(`${FRONTEND_BASE_URL}/sso-landing?${params.toString()}`);
+
+    } catch (err) {
+        console.error('SSO (GET) login error:', err);
+        return failToLogin('SERVER_ERROR');
     }
 });
 
