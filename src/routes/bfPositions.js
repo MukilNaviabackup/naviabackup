@@ -557,7 +557,7 @@ router.get('/positions', async (req, res) => {
                     bf.settlement_price, bf.biz_date, bf.file_source,
                     bf.terminal,
                     bf.qty_actual,
-                    ISNULL(bf.qty_actual, bf.total_open_qty) AS display_qty
+                    bf.total_open_qty AS display_qty
                 FROM bf_positions bf
                 WHERE bf.ucc = @ucc
                 AND   bf.biz_date = CAST(DATEADD(MINUTE, 330, GETDATE()) AS DATE)
