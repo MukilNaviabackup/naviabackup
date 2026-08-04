@@ -285,7 +285,32 @@ async function sendTradeWhatsApp(client, order, statusLabel) {
             },
             body: JSON.stringify(waPayload)
         });
-        const waData = await waRes.json();
+
+        // Read as text first so a non-JSON or empty body (e.g. a 401/502/504
+        // from the Engati gateway with no payload) doesn't just surface as an
+        // opaque "Unexpected end of JSON input" -- we log the real HTTP status
+        // and raw body instead, which is what actually tells us what broke.
+        const waRawBody = await waRes.text();
+
+        let waData;
+        try {
+            waData = waRawBody ? JSON.parse(waRawBody) : {};
+        } catch (parseErr) {
+            console.error(
+                `[TradeNotify] WhatsApp non-JSON response for ${order.ucc} — ` +
+                `HTTP ${waRes.status} ${waRes.statusText}, body: ${waRawBody.slice(0, 500) || '(empty)'}`
+            );
+            return false;
+        }
+
+        if (!waRes.ok) {
+            console.error(
+                `[TradeNotify] WhatsApp HTTP ${waRes.status} for ${order.ucc}:`,
+                JSON.stringify(waData).slice(0, 500)
+            );
+            return false;
+        }
+
         if (waData.messages && waData.messages[0]?.id) {
             console.log(`[TradeNotify] WhatsApp sent to ${order.ucc} (${waNumber}): ${waData.messages[0].id}`);
             return true;
