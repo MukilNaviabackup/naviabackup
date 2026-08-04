@@ -53,6 +53,15 @@ function createTransporter() {
     });
 }
 
+// WhatsApp send (migrated from 360dialog to Engati WABA, 2026-08-04).
+// URL changed from https://waba-v2.360dialog.io/messages to
+// https://wabm.engati.ai/v1/messages. Header name (D360-API-KEY) and
+// payload shape are UNCHANGED on purpose -- confirm with Engati/the WABA
+// management team that they accept the identical Cloud-API-style header +
+// body before relying on this in production; if they don't, sends will
+// fail with a visible error in the console.error line below rather than
+// silently. The old hardcoded fallback API key literal has been removed --
+// WABA_API_KEY must be set in Azure App Service Configuration.
 async function sendWhatsApp(mobile, clientName, ucc) {
     try {
         const mobileClean = mobile.toString().replace(/\D/g, '');
@@ -78,10 +87,10 @@ async function sendWhatsApp(mobile, clientName, ucc) {
                 }]
             }
         };
-        const waRes  = await fetch('https://waba-v2.360dialog.io/messages', {
+        const waRes  = await fetch('https://wabm.engati.ai/v1/messages', {
             method: 'POST',
             headers: {
-                'D360-API-KEY': process.env.WABA_API_KEY || 'fMEhZfQoSD1T80Q7a8Dez1OpAK',
+                'D360-API-KEY': process.env.WABA_API_KEY,
                 'Content-Type': 'application/json'
             },
             body: JSON.stringify(waPayload)

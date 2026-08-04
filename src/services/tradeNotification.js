@@ -223,9 +223,14 @@ async function sendTradeEmail(client, order, statusLabel) {
     }
 }
 
-/* ── WhatsApp via 360dialog (same proven integration as adminControl.js) ────*/
-// Reuses the exact endpoint, auth header, and payload shape already live
-// for downtime client communication — see backend/src/routes/adminControl.js
+/* ── WhatsApp via Engati WABA (migrated from 360dialog 2026-08-04) ──────────*/
+// URL/provider changed: WABA management moved from 360dialog to Engati.
+// Endpoint, header name (D360-API-KEY), and payload shape below are UNCHANGED
+// from the prior 360dialog integration on purpose -- confirm with Engati/the
+// WABA management team that wabm.engati.ai/v1/messages accepts the identical
+// Cloud-API-style header + body before relying on this in production. If it
+// doesn't, sends will fail with a non-2xx/JSON-shape error from waData below
+// (visible in the [TradeNotify] WhatsApp failed log line) rather than silently.
 async function sendTradeWhatsApp(client, order, statusLabel) {
     if (!client.mobile) {
         console.warn(`[TradeNotify] No mobile on file for UCC ${order.ucc} — skipping WhatsApp`);
@@ -272,7 +277,7 @@ async function sendTradeWhatsApp(client, order, statusLabel) {
     };
 
     try {
-        const waRes = await fetch('https://waba-v2.360dialog.io/messages', {
+        const waRes = await fetch('https://wabm.engati.ai/v1/messages', {
             method: 'POST',
             headers: {
                 'D360-API-KEY': process.env.WABA_API_KEY,
