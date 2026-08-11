@@ -41,14 +41,28 @@ router.post('/squareoff', authenticate, async (req, res) => {
     const { ucc, loginType } = req.user;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || null;
 
-    // ── Block SSO only if it is NOT a dealer SSO ──────────────────────────
+    // isDealer distinguishes a dealer placing on a client's behalf (used
+    // below for placed_by/dealer_id) from a client placing their own order.
     const isDealer = !!(dealerId || placedBy);
-    if (loginType === 'SSO' && !isDealer) {
-        return res.status(403).json({
-            error: 'SSO_BLOCKED',
-            message: 'It seems our trading application is functioning. You cannot place a square-off request via Navia Backup at this time.'
-        });
-    }
+
+    // FIX (2026-08-11): removed the old blanket "loginType === 'SSO' && !isDealer"
+    // block that used to sit here. It unconditionally rejected every square-off
+    // from a client who arrived via the trading app's Account-menu SSO handoff
+    // (loginType is set to 'SSO' for that session, exactly like every other
+    // client session it creates) -- regardless of whether the segment was
+    // actually enabled in Segment Control. That made self-service square-off
+    // via SSO impossible even when Inhouse/NSE/BSE/MCX/CM/FO were all switched
+    // on, which is the bug reported: SSO clients got "Square-off unavailable
+    // / Trading platform is functioning" on every attempt, while the exact
+    // same client logging in directly (UCC+DOB+OTP) could place the same
+    // order without issue. Whether square-off is actually allowed right now
+    // is already correctly decided by the segment_controls check directly
+    // below (the same gate every other login path goes through) -- this
+    // extra SSO-specific block was redundant with it at best, and at worst a
+    // leftover from before the segment_controls gate existed, and simply
+    // never got reconciled with it. Removing it here does not weaken any
+    // check: is_enabled in Segment Control is still the single source of
+    // truth for whether square-off is allowed, for every login path alike.
 
     if (!exchange || !segment || !symbol || !quantity || !side) {
         return res.status(400).json({ error: 'All fields are required.' });
