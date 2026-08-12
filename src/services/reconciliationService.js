@@ -249,9 +249,18 @@ async function getCMExecutedQty(pool, order) {
     const sideCol  = (order.side || '').toUpperCase() === 'BUY' ? 'buy_qty'       : 'sell_qty';
     const priceCol = (order.side || '').toUpperCase() === 'BUY' ? 'avg_buy_price' : 'avg_sell_price';
 
+    // FIX (2026-08-11): added dp.exchange = @exchange. Without it, a client
+    // holding the same ISIN listed on both NSE and BSE (dual-listed stock)
+    // had their day_positions rows from BOTH exchanges summed together here,
+    // regardless of which exchange this specific square-off order was placed
+    // on -- so an NSE order's executed qty could be inflated by an unrelated
+    // BSE-side trade in the same security, and vice versa. Not the cause of
+    // the IDEA incident (single-exchange case), but the same class of bug --
+    // fixing alongside the baseline-query ISIN fix while in this code.
     const result = await pool.request()
         .input('ucc',      sql.VarChar(20),  order.ucc)
         .input('isin',     sql.VarChar(20),  order.isin)
+        .input('exchange', sql.VarChar(10),  order.exchange)
         .query(`
             SELECT SUM(dp.${sideCol}) AS executed_qty,
                    SUM(dp.${priceCol} * dp.${sideCol}) / NULLIF(SUM(dp.${sideCol}),0) AS trade_price
@@ -259,6 +268,7 @@ async function getCMExecutedQty(pool, order) {
             JOIN symbol_master sm ON dp.symbol = sm.nse_symbol OR dp.symbol = sm.bse_symbol
             WHERE dp.ucc          = @ucc
             AND   sm.isin         = @isin
+            AND   dp.exchange     = @exchange
             AND   dp.trade_date   = CAST(GETDATE() AS DATE)
             AND   dp.segment      = 'CM'
         `);

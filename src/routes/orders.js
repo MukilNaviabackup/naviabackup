@@ -129,50 +129,6 @@ router.post('/squareoff', authenticate, async (req, res) => {
         const strikePrice = strike_price ? parseFloat(strike_price) : null;
         const optType     = option_type  || null;
 
-        // ── Capture baseline qty for reconciliation (compliance fix) ──────
-        // day_positions.buy_qty/sell_qty are CUMULATIVE totals for the whole
-        // trading day, not a log of individual trades. If this client already
-        // completed an earlier buy/sell round-trip in this same symbol today,
-        // that leftover quantity must NOT be allowed to satisfy THIS order.
-        // Snapshot the current cumulative quantity (matching this order's
-        // side) right now, at placement time, so reconciliationService can
-        // later look only at the INCREMENT since this moment -- not the
-        // day's raw running total. This fixes the case where an order was
-        // matched (and the client was told "successfully executed") against
-        // a trade that happened BEFORE the order was even placed.
-        const baselineSideCol = side.toUpperCase() === 'BUY' ? 'buy_qty' : 'sell_qty';
-        const baselineResult = await pool.request()
-            .input('ucc',        sql.VarChar,       ucc)
-            .input('symbol',     sql.VarChar,       symbol.toUpperCase())
-            .input('exchange',   sql.VarChar,       exchange.toUpperCase())
-            .input('segment',    sql.VarChar,       segment.toUpperCase())
-            .input('expiry',     sql.Date,          expiryDate)
-            .input('strike',     sql.Decimal(18,2), strikePrice)
-            .input('optionType', sql.VarChar(5),    optType)
-            .query(`
-                SELECT ISNULL(SUM(${baselineSideCol}), 0) AS baseline_qty
-                FROM day_positions
-                WHERE ucc          = @ucc
-                AND   symbol       = @symbol
-                AND   exchange     = @exchange
-                AND   segment      = @segment
-                AND   trade_date   = CAST(GETDATE() AS DATE)
-                AND   (
-                    (@expiry IS NULL AND expiry_date IS NULL)
-                    OR expiry_date = @expiry
-                )
-                AND   (
-                    (@strike IS NULL AND strike_price IS NULL)
-                    OR ABS(strike_price - @strike) < 0.01
-                )
-                AND   (
-                    (@optionType IS NULL AND option_type IS NULL)
-                    OR option_type = @optionType
-                )
-            `);
-        const baselineQty = Number(baselineResult.recordset[0]?.baseline_qty) || 0;
-        console.log(`[Orders] Step 4.5: baseline qty captured = ${baselineQty} (${baselineSideCol})`);
-
         // FIX (2026-07-21, rev1): squareoff_orders.isin was never populated
         // at insert time, even though the table has the column and
         // reconciliationService.js specifically checks `if (!order.isin)` to
@@ -193,10 +149,92 @@ router.post('/squareoff', authenticate, async (req, res) => {
         // Holdings square-offs too. Extracted from the SAME upper-cased
         // symbol string that actually gets stored below, so the delimiter
         // check/extraction always matches what's in the row.
+        //
+        // MOVED UP (2026-08-11): now computed BEFORE the baseline capture
+        // below, because the baseline query needs it too -- see next fix.
         const symbolUpper = symbol.toUpperCase();
         const orderIsin = symbolUpper.includes(' ; ')
             ? symbolUpper.substring(symbolUpper.indexOf(' ; ') + 3).trim()
             : null;
+
+        // ── Capture baseline qty for reconciliation (compliance fix) ──────
+        // day_positions.buy_qty/sell_qty are CUMULATIVE totals for the whole
+        // trading day, not a log of individual trades. If this client already
+        // completed an earlier buy/sell round-trip in this same symbol today,
+        // that leftover quantity must NOT be allowed to satisfy THIS order.
+        // Snapshot the current cumulative quantity (matching this order's
+        // side) right now, at placement time, so reconciliationService can
+        // later look only at the INCREMENT since this moment -- not the
+        // day's raw running total. This fixes the case where an order was
+        // matched (and the client was told "successfully executed") against
+        // a trade that happened BEFORE the order was even placed.
+        //
+        // BUG FIX (2026-08-11, IDEA false-trade incident): for CM Holdings
+        // orders, squareoff_orders.symbol is the compound "COMPANY NAME EQ ;
+        // ISIN" string, but day_positions.symbol stores the plain exchange
+        // trading symbol (e.g. "IDEA") -- they never match. The old query
+        // below (`symbol = @symbol`) silently returned 0 rows for every
+        // compound-symbol order, so baseline_qty was ALWAYS 0 regardless of
+        // how many trades the client already had that day. Reconciliation's
+        // own getCMExecutedQty() correctly resolves this via an ISIN join to
+        // symbol_master -- so it saw the real cumulative qty while the
+        // order's baseline stayed 0, and any pre-existing same-day trade(s)
+        // got misattributed as this order's own execution the moment
+        // file_generated flipped it into recon's scope. Fix: when an ISIN is
+        // present, capture the baseline through the identical ISIN join
+        // reconciliation uses, so baseline and rawExecutedQty are always
+        // computed the same way.
+        const isCM = segment.toUpperCase() === 'CM';
+        const baselineSideCol = side.toUpperCase() === 'BUY' ? 'buy_qty' : 'sell_qty';
+
+        let baselineQty = 0;
+        if (isCM && orderIsin) {
+            const baselineResult = await pool.request()
+                .input('ucc',  sql.VarChar, ucc)
+                .input('isin', sql.VarChar(20), orderIsin)
+                .query(`
+                    SELECT ISNULL(SUM(dp.${baselineSideCol}), 0) AS baseline_qty
+                    FROM day_positions dp
+                    JOIN symbol_master sm ON dp.symbol = sm.nse_symbol OR dp.symbol = sm.bse_symbol
+                    WHERE dp.ucc        = @ucc
+                    AND   sm.isin       = @isin
+                    AND   dp.trade_date = CAST(GETDATE() AS DATE)
+                    AND   dp.segment    = 'CM'
+                `);
+            baselineQty = Number(baselineResult.recordset[0]?.baseline_qty) || 0;
+        } else {
+            const baselineResult = await pool.request()
+                .input('ucc',        sql.VarChar,       ucc)
+                .input('symbol',     sql.VarChar,       symbol.toUpperCase())
+                .input('exchange',   sql.VarChar,       exchange.toUpperCase())
+                .input('segment',    sql.VarChar,       segment.toUpperCase())
+                .input('expiry',     sql.Date,          expiryDate)
+                .input('strike',     sql.Decimal(18,2), strikePrice)
+                .input('optionType', sql.VarChar(5),    optType)
+                .query(`
+                    SELECT ISNULL(SUM(${baselineSideCol}), 0) AS baseline_qty
+                    FROM day_positions
+                    WHERE ucc          = @ucc
+                    AND   symbol       = @symbol
+                    AND   exchange     = @exchange
+                    AND   segment      = @segment
+                    AND   trade_date   = CAST(GETDATE() AS DATE)
+                    AND   (
+                        (@expiry IS NULL AND expiry_date IS NULL)
+                        OR expiry_date = @expiry
+                    )
+                    AND   (
+                        (@strike IS NULL AND strike_price IS NULL)
+                        OR ABS(strike_price - @strike) < 0.01
+                    )
+                    AND   (
+                        (@optionType IS NULL AND option_type IS NULL)
+                        OR option_type = @optionType
+                    )
+                `);
+            baselineQty = Number(baselineResult.recordset[0]?.baseline_qty) || 0;
+        }
+        console.log(`[Orders] Step 4.5: baseline qty captured = ${baselineQty} (${baselineSideCol}${isCM && orderIsin ? ', ISIN-matched' : ''})`);
 
         await pool.request()
             .input('orderId',     sql.VarChar,     orderId)
