@@ -894,14 +894,19 @@ router.post('/cdd-sqoff/control', adminAuthenticate, blockDealerAdmin, async (re
 });
 
 // List whitelisted UCCs
+// FIX (2026-08-14): the live cdd_sqoff_whitelist table was created from an
+// earlier draft schema (added_by VARCHAR, no admin_id FK) rather than the
+// FK-based design this route was originally written against -- confirmed via
+// INFORMATION_SCHEMA.COLUMNS against the real table. added_by already stores
+// the admin's username directly as text, so no JOIN to admin_users is needed
+// here at all.
 router.get('/cdd-sqoff/whitelist', adminAuthenticate, async (req, res) => {
     try {
         const pool   = await getConnection();
         const result = await pool.request().query(`
-            SELECT w.id, w.ucc, c.client_name, w.added_at, au.username AS added_by_username
+            SELECT w.id, w.ucc, c.client_name, w.added_at, w.added_by AS added_by_username
             FROM cdd_sqoff_whitelist w
             LEFT JOIN clients c ON w.ucc = c.ucc
-            LEFT JOIN admin_users au ON w.added_by_admin_id = au.admin_id
             ORDER BY w.added_at DESC
         `);
         return res.json({ success: true, whitelist: result.recordset });
@@ -925,11 +930,21 @@ router.post('/cdd-sqoff/whitelist', adminAuthenticate, blockDealerAdmin, async (
             return res.status(404).json({ error: `UCC ${uccTrimmed} not found in clients.` });
         }
 
+        // Resolve the logged-in admin's username from admin_id -- req.admin.adminId
+        // is the one field already confirmed working (used successfully by the
+        // /cdd-sqoff/control route above). Looking the username up here, rather
+        // than trusting a possibly-absent req.admin.username, keeps this route
+        // correct regardless of exactly what adminAuthenticate puts on req.admin.
+        const adminRes = await pool.request()
+            .input('adminId', sql.Int, req.admin.adminId)
+            .query(`SELECT username FROM admin_users WHERE admin_id = @adminId`);
+        const addedByUsername = adminRes.recordset[0]?.username || `admin_${req.admin.adminId}`;
+
         await pool.request()
             .input('ucc',     sql.VarChar(20), uccTrimmed)
-            .input('adminId', sql.Int,         req.admin.adminId)
-            .query(`INSERT INTO cdd_sqoff_whitelist (ucc, added_by_admin_id, added_at)
-                    VALUES (@ucc, @adminId, GETDATE())`);
+            .input('addedBy', sql.VarChar(50), addedByUsername)
+            .query(`INSERT INTO cdd_sqoff_whitelist (ucc, added_by, added_at)
+                    VALUES (@ucc, @addedBy, GETDATE())`);
 
         return res.json({ success: true, message: `UCC ${uccTrimmed} added to CDD Sq.off whitelist.` });
     } catch (err) {
