@@ -93,6 +93,34 @@ router.post('/squareoff', authenticate, async (req, res) => {
             });
         }
 
+        // ── CDD Sq.off Report gate (2026-08-14) ─────────────────────────────
+        // Additional restriction gate for the current production-rollout
+        // phase. The segment_controls check above is completely untouched
+        // and remains the primary gate -- this is purely an extra AND
+        // condition. When cdd_sqoff_control.is_enabled = 0 (the default),
+        // this block is a no-op and behavior is identical to before this
+        // change. When turned ON by an admin, only UCCs present in
+        // cdd_sqoff_whitelist may proceed; everyone else gets the exact same
+        // denial response as a disabled segment, so no frontend change is
+        // needed to handle this new case.
+        const cddCtrlResult = await pool.request()
+            .query(`SELECT TOP 1 is_enabled FROM cdd_sqoff_control`);
+        const cddRestricted = cddCtrlResult.recordset.length > 0 &&
+            (cddCtrlResult.recordset[0].is_enabled === true || cddCtrlResult.recordset[0].is_enabled === 1);
+
+        if (cddRestricted) {
+            const cddWhitelistResult = await pool.request()
+                .input('ucc', sql.VarChar, ucc)
+                .query(`SELECT 1 FROM cdd_sqoff_whitelist WHERE ucc = @ucc`);
+            if (!cddWhitelistResult.recordset.length) {
+                console.log(`[Orders] CDD Sq.off restriction active — UCC=${ucc} not whitelisted, blocking.`);
+                return res.status(403).json({
+                    error: 'SEGMENT_DISABLED',
+                    message: 'It seems our trading application is functioning. You cannot place a square-off request via Navia Backup at this time.'
+                });
+            }
+        }
+
         // ── Check duplicate ───────────────────────────────────────────────
         const existing = await pool.request()
             .input('ucc',      sql.VarChar, ucc)

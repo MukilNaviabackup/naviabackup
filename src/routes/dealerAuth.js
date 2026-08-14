@@ -748,6 +748,28 @@ router.post('/place-squareoff', async (req, res) => {
             return res.status(403).json({ error: 'SEGMENT_DISABLED', message: 'Trading application is functioning normally.' });
         }
 
+        // ── CDD Sq.off Report gate (2026-08-14) ─────────────────────────────
+        // Same additional restriction gate as the client route's /squareoff
+        // (orders.js) -- see that file for full reasoning. Ensures a dealer
+        // placing on a client's behalf is bound by the same whitelist rule,
+        // so the restriction can't be bypassed via the dealer path while
+        // it's turned on. segCtrl above is completely untouched -- this is
+        // purely an additional AND condition, a no-op when the toggle is off.
+        const cddCtrl = await pool.request()
+            .query(`SELECT TOP 1 is_enabled FROM cdd_sqoff_control`);
+        const cddRestricted = cddCtrl.recordset.length > 0 &&
+            (cddCtrl.recordset[0].is_enabled === true || cddCtrl.recordset[0].is_enabled === 1);
+
+        if (cddRestricted) {
+            const cddWhitelist = await pool.request()
+                .input('ucc', sql.VarChar(20), ucc)
+                .query(`SELECT 1 FROM cdd_sqoff_whitelist WHERE ucc = @ucc`);
+            if (!cddWhitelist.recordset.length) {
+                console.log(`[DealerOrders] CDD Sq.off restriction active — UCC=${ucc} not whitelisted, blocking.`);
+                return res.status(403).json({ error: 'SEGMENT_DISABLED', message: 'Trading application is functioning normally.' });
+            }
+        }
+
         // ── Check duplicate ───────────────────────────────────────────────────
         // Fixed to match the client route's logic exactly (orders.js /squareoff):
         // - Must also exclude ORDER_TRADED/TRADED as resolved -- the old version

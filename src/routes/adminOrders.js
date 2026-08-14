@@ -837,4 +837,123 @@ router.get('/dealer-logs', adminAuthenticate, async (req, res) => {
     } catch (err) { return res.status(500).json({ error: 'Failed to fetch dealer logs.' }); }
 });
 
+// ══════════════════════════════════════════════════════════════════════════
+// CDD Sq.off Report — production-rollout restriction gate (2026-08-14)
+// ══════════════════════════════════════════════════════════════════════════
+// A second, independent gate layered on top of the existing segment_controls
+// check in orders.js (/squareoff) and dealerAuth.js (/place-squareoff).
+// When cdd_sqoff_control.is_enabled = 1, a square-off is only allowed for
+// UCCs present in cdd_sqoff_whitelist -- everyone else gets the exact same
+// denial they'd see for a disabled segment. Does not touch segment_controls,
+// or any of its existing routes/UI, in any way. Same adminAuthenticate /
+// blockDealerAdmin restriction level as this file's other write routes --
+// read-only GETs are adminAuthenticate only, writes add blockDealerAdmin.
+
+// Get current restriction toggle state
+router.get('/cdd-sqoff/control', adminAuthenticate, async (req, res) => {
+    try {
+        const pool   = await getConnection();
+        const result = await pool.request().query(`SELECT TOP 1 is_enabled, updated_at FROM cdd_sqoff_control`);
+        return res.json({ success: true, control: result.recordset[0] || { is_enabled: false, updated_at: null } });
+    } catch (err) {
+        return res.status(500).json({ error: 'Failed to fetch CDD Sq.off control state.' });
+    }
+});
+
+// Toggle the restriction on/off
+router.post('/cdd-sqoff/control', adminAuthenticate, blockDealerAdmin, async (req, res) => {
+    const { is_enabled } = req.body;
+    if (typeof is_enabled !== 'boolean') return res.status(400).json({ error: 'is_enabled (boolean) is required.' });
+    try {
+        const pool = await getConnection();
+        await pool.request()
+            .input('isEnabled', sql.Bit, is_enabled ? 1 : 0)
+            .input('adminId',   sql.Int, req.admin.adminId)
+            .query(`UPDATE cdd_sqoff_control
+                    SET is_enabled = @isEnabled, updated_by = @adminId, updated_at = GETDATE()
+                    WHERE id = 1`);
+
+        // Audit log — same admin_logs table used elsewhere in this codebase;
+        // wrapped so a logging failure can never take down the actual
+        // toggle, which has already succeeded by this point.
+        try {
+            await pool.request()
+                .input('adminId', sql.Int,          req.admin.adminId)
+                .input('action',  sql.VarChar(100), 'CDD_SQOFF_CONTROL_TOGGLED')
+                .input('details', sql.VarChar(500), `CDD Sq.off restriction set to ${is_enabled ? 'ON' : 'OFF'} by admin ${req.admin.adminId}`)
+                .query(`INSERT INTO admin_logs (admin_id, action, details, created_at) VALUES (@adminId, @action, @details, GETDATE())`);
+        } catch (logErr) {
+            console.error('[CDD Sq.off] admin_logs write failed (non-fatal):', logErr.message);
+        }
+
+        return res.json({ success: true, message: `CDD Sq.off restriction turned ${is_enabled ? 'ON' : 'OFF'}.` });
+    } catch (err) {
+        console.error('CDD Sq.off control toggle error:', err);
+        return res.status(500).json({ error: 'Failed to update CDD Sq.off control state.' });
+    }
+});
+
+// List whitelisted UCCs
+router.get('/cdd-sqoff/whitelist', adminAuthenticate, async (req, res) => {
+    try {
+        const pool   = await getConnection();
+        const result = await pool.request().query(`
+            SELECT w.id, w.ucc, c.client_name, w.added_at, au.username AS added_by_username
+            FROM cdd_sqoff_whitelist w
+            LEFT JOIN clients c ON w.ucc = c.ucc
+            LEFT JOIN admin_users au ON w.added_by_admin_id = au.admin_id
+            ORDER BY w.added_at DESC
+        `);
+        return res.json({ success: true, whitelist: result.recordset });
+    } catch (err) {
+        return res.status(500).json({ error: 'Failed to fetch CDD Sq.off whitelist.' });
+    }
+});
+
+// Add a UCC to the whitelist
+router.post('/cdd-sqoff/whitelist', adminAuthenticate, blockDealerAdmin, async (req, res) => {
+    const { ucc } = req.body;
+    if (!ucc || !ucc.trim()) return res.status(400).json({ error: 'UCC is required.' });
+    const uccTrimmed = ucc.trim();
+    try {
+        const pool = await getConnection();
+
+        const clientCheck = await pool.request()
+            .input('ucc', sql.VarChar(20), uccTrimmed)
+            .query(`SELECT ucc, client_name FROM clients WHERE ucc = @ucc`);
+        if (clientCheck.recordset.length === 0) {
+            return res.status(404).json({ error: `UCC ${uccTrimmed} not found in clients.` });
+        }
+
+        await pool.request()
+            .input('ucc',     sql.VarChar(20), uccTrimmed)
+            .input('adminId', sql.Int,         req.admin.adminId)
+            .query(`INSERT INTO cdd_sqoff_whitelist (ucc, added_by_admin_id, added_at)
+                    VALUES (@ucc, @adminId, GETDATE())`);
+
+        return res.json({ success: true, message: `UCC ${uccTrimmed} added to CDD Sq.off whitelist.` });
+    } catch (err) {
+        if (err.message && err.message.includes('UNIQUE')) {
+            return res.status(400).json({ error: `UCC ${uccTrimmed} is already whitelisted.` });
+        }
+        console.error('CDD Sq.off whitelist add error:', err);
+        return res.status(500).json({ error: 'Failed to add UCC to whitelist.' });
+    }
+});
+
+// Remove a UCC from the whitelist
+router.delete('/cdd-sqoff/whitelist/:ucc', adminAuthenticate, blockDealerAdmin, async (req, res) => {
+    const uccTrimmed = (req.params.ucc || '').trim();
+    if (!uccTrimmed) return res.status(400).json({ error: 'UCC is required.' });
+    try {
+        const pool = await getConnection();
+        await pool.request()
+            .input('ucc', sql.VarChar(20), uccTrimmed)
+            .query(`DELETE FROM cdd_sqoff_whitelist WHERE ucc = @ucc`);
+        return res.json({ success: true, message: `UCC ${uccTrimmed} removed from CDD Sq.off whitelist.` });
+    } catch (err) {
+        return res.status(500).json({ error: 'Failed to remove UCC from whitelist.' });
+    }
+});
+
 module.exports = router;
