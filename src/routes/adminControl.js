@@ -78,7 +78,10 @@ async function sendWhatsApp(mobile, clientName, ucc) {
             type: 'template',
             template: {
                 name: 'new_navia_backup_022026',
-                language: { policy: 'deterministic', code: 'en' },
+                // 2026-08-20: Engati changed the approved template's
+                // language code from 'en' to 'en_US' on their side -- see
+                // the matching fix/comment in tradeNotify.js.
+                language: { policy: 'deterministic', code: 'en_US' },
                 components: [{
                     type: 'body',
                     parameters: [
