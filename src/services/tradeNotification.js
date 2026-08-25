@@ -223,6 +223,39 @@ async function sendTradeEmail(client, order, statusLabel) {
     }
 }
 
+/* ── Persistent WhatsApp API log (2026-08-25) ────────────────────────────────*/
+// Durable copy of every Engati request/response, in whatsapp_api_log --
+// see Migration_whatsapp_api_log.sql. Console logs (below) are unchanged and
+// stay as the fast/live view; this is the "never depend on Log Stream's
+// rolling buffer again" copy. A DB write failure here must never break
+// notification delivery, so this is wrapped in its own try/catch and never
+// awaited-and-thrown by any caller.
+async function logWhatsAppAttempt(pool, sql, entry) {
+    if (!pool || !sql) return; // defensive -- caller always passes both today
+    try {
+        await pool.request()
+            .input('source',         sql.VarChar(30),   entry.source || 'TRADE_NOTIFY')
+            .input('ucc',            sql.VarChar(20),   entry.ucc || null)
+            .input('orderId',        sql.VarChar(50),   entry.orderId || null)
+            .input('mobile',         sql.VarChar(20),   entry.mobile || null)
+            .input('templateName',   sql.VarChar(100),  entry.templateName || null)
+            .input('requestPayload', sql.NVarChar(sql.MAX), entry.requestPayload || null)
+            .input('httpStatus',     sql.Int,           entry.httpStatus ?? null)
+            .input('responseBody',   sql.NVarChar(sql.MAX), entry.responseBody || null)
+            .input('messageId',      sql.VarChar(150),  entry.messageId || null)
+            .input('success',        sql.Bit,           entry.success ? 1 : 0)
+            .input('errorMessage',   sql.NVarChar(500), entry.errorMessage || null)
+            .query(`INSERT INTO whatsapp_api_log
+                    (source, ucc, order_id, mobile, template_name, request_payload,
+                     http_status, response_body, message_id, success, error_message)
+                    VALUES
+                    (@source, @ucc, @orderId, @mobile, @templateName, @requestPayload,
+                     @httpStatus, @responseBody, @messageId, @success, @errorMessage)`);
+    } catch (err) {
+        console.error('[TradeNotify] whatsapp_api_log write failed:', err.message);
+    }
+}
+
 /* ── WhatsApp via Engati WABA (migrated from 360dialog 2026-08-04) ──────────*/
 // URL/provider changed: WABA management moved from 360dialog to Engati.
 // Endpoint, header name (D360-API-KEY), and payload shape below are UNCHANGED
@@ -231,7 +264,7 @@ async function sendTradeEmail(client, order, statusLabel) {
 // Cloud-API-style header + body before relying on this in production. If it
 // doesn't, sends will fail with a non-2xx/JSON-shape error from waData below
 // (visible in the [TradeNotify] WhatsApp failed log line) rather than silently.
-async function sendTradeWhatsApp(client, order, statusLabel) {
+async function sendTradeWhatsApp(pool, sql, client, order, statusLabel) {
     if (!client.mobile) {
         console.warn(`[TradeNotify] No mobile on file for UCC ${order.ucc} — skipping WhatsApp`);
         return false;
@@ -307,6 +340,12 @@ async function sendTradeWhatsApp(client, order, statusLabel) {
                 `[TradeNotify] WhatsApp non-JSON response for ${order.ucc} — ` +
                 `HTTP ${waRes.status} ${waRes.statusText}, body: ${waRawBody.slice(0, 500) || '(empty)'}`
             );
+            await logWhatsAppAttempt(pool, sql, {
+                source: 'TRADE_NOTIFY', ucc: order.ucc, orderId: order.order_id,
+                mobile: waNumber, templateName, requestPayload: JSON.stringify(waPayload),
+                httpStatus: waRes.status, responseBody: waRawBody, success: false,
+                errorMessage: `Non-JSON response: ${waRes.status} ${waRes.statusText}`,
+            });
             return false;
         }
 
@@ -315,17 +354,46 @@ async function sendTradeWhatsApp(client, order, statusLabel) {
                 `[TradeNotify] WhatsApp HTTP ${waRes.status} for ${order.ucc}:`,
                 JSON.stringify(waData).slice(0, 500)
             );
+            await logWhatsAppAttempt(pool, sql, {
+                source: 'TRADE_NOTIFY', ucc: order.ucc, orderId: order.order_id,
+                mobile: waNumber, templateName, requestPayload: JSON.stringify(waPayload),
+                httpStatus: waRes.status, responseBody: waRawBody, success: false,
+                errorMessage: `HTTP ${waRes.status}`,
+            });
             return false;
         }
 
         if (waData.messages && waData.messages[0]?.id) {
             console.log(`[TradeNotify] WhatsApp sent to ${order.ucc} (${waNumber}): ${waData.messages[0].id}`);
+            // 2026-08-25: additive diagnostic log -- full raw Engati response
+            // body (contacts[], messages[], any status fields Engati includes
+            // on accept) so send-side details are visible directly in our own
+            // logs without needing the Engati dashboard. Purely additive --
+            // does not change return value, control flow, or the line above.
+            console.log(`[TradeNotify] WhatsApp full response for ${order.ucc}: ${waRawBody.slice(0, 1000)}`);
+            await logWhatsAppAttempt(pool, sql, {
+                source: 'TRADE_NOTIFY', ucc: order.ucc, orderId: order.order_id,
+                mobile: waNumber, templateName, requestPayload: JSON.stringify(waPayload),
+                httpStatus: waRes.status, responseBody: waRawBody,
+                messageId: waData.messages[0].id, success: true,
+            });
             return true;
         }
         console.error(`[TradeNotify] WhatsApp failed for ${order.ucc}:`, JSON.stringify(waData));
+        await logWhatsAppAttempt(pool, sql, {
+            source: 'TRADE_NOTIFY', ucc: order.ucc, orderId: order.order_id,
+            mobile: waNumber, templateName, requestPayload: JSON.stringify(waPayload),
+            httpStatus: waRes.status, responseBody: waRawBody, success: false,
+            errorMessage: 'No message id in response',
+        });
         return false;
     } catch (err) {
         console.error(`[TradeNotify] WhatsApp error for ${order.ucc}:`, err.message);
+        await logWhatsAppAttempt(pool, sql, {
+            source: 'TRADE_NOTIFY', ucc: order.ucc, orderId: order.order_id,
+            mobile: client.mobile, templateName, success: false,
+            errorMessage: err.message,
+        });
         return false;
     }
 }
@@ -350,7 +418,7 @@ async function notifyTradeStatusChange(pool, sql, order, newStatus) {
         // Fire both, don't let one failure block the other
         await Promise.allSettled([
             sendTradeEmail(client, order, statusLabel),
-            sendTradeWhatsApp(client, order, statusLabel),
+            sendTradeWhatsApp(pool, sql, client, order, statusLabel),
         ]);
     } catch (err) {
         console.error('[TradeNotify] notifyTradeStatusChange error:', err.message);

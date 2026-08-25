@@ -53,6 +53,39 @@ function createTransporter() {
     });
 }
 
+// Persistent WhatsApp API log (2026-08-25) -- same table/purpose as the
+// identical helper in tradeNotify.js (see Migration_whatsapp_api_log.sql
+// and the comment there). Duplicated rather than shared/imported because
+// these two files have no existing shared-utils module between them, and
+// this keeps the change fully additive/local to each file. A DB write
+// failure here must never break Alert Clients sending, so it's wrapped in
+// its own try/catch and never awaited-and-thrown by any caller.
+async function logWhatsAppAttempt(pool, entry) {
+    if (!pool) return; // defensive -- caller always passes pool today
+    try {
+        await pool.request()
+            .input('source',         sql.VarChar(30),   entry.source || 'ALERT_CLIENTS')
+            .input('ucc',            sql.VarChar(20),   entry.ucc || null)
+            .input('commId',         sql.Int,           entry.commId ?? null)
+            .input('mobile',         sql.VarChar(20),   entry.mobile || null)
+            .input('templateName',   sql.VarChar(100),  entry.templateName || null)
+            .input('requestPayload', sql.NVarChar(sql.MAX), entry.requestPayload || null)
+            .input('httpStatus',     sql.Int,           entry.httpStatus ?? null)
+            .input('responseBody',   sql.NVarChar(sql.MAX), entry.responseBody || null)
+            .input('messageId',      sql.VarChar(150),  entry.messageId || null)
+            .input('success',        sql.Bit,           entry.success ? 1 : 0)
+            .input('errorMessage',   sql.NVarChar(500), entry.errorMessage || null)
+            .query(`INSERT INTO whatsapp_api_log
+                    (source, ucc, comm_id, mobile, template_name, request_payload,
+                     http_status, response_body, message_id, success, error_message)
+                    VALUES
+                    (@source, @ucc, @commId, @mobile, @templateName, @requestPayload,
+                     @httpStatus, @responseBody, @messageId, @success, @errorMessage)`);
+    } catch (err) {
+        console.error('[AdminControl] whatsapp_api_log write failed:', err.message);
+    }
+}
+
 // WhatsApp send (migrated from 360dialog to Engati WABA, 2026-08-04).
 // URL changed from https://waba-v2.360dialog.io/messages to
 // https://wabm.engati.ai/v1/messages. Header name (D360-API-KEY) and
@@ -62,22 +95,24 @@ function createTransporter() {
 // fail with a visible error in the console.error line below rather than
 // silently. The old hardcoded fallback API key literal has been removed --
 // WABA_API_KEY must be set in Azure App Service Configuration.
-async function sendWhatsApp(mobile, clientName, ucc) {
+async function sendWhatsApp(pool, mobile, clientName, ucc, commId) {
+    const templateName = 'new_navia_backup_022026';
+    let waNumber, waPayload;
     try {
         const mobileClean = mobile.toString().replace(/\D/g, '');
-        const waNumber = mobileClean.startsWith('91') ? mobileClean : `91${mobileClean}`;
+        waNumber = mobileClean.startsWith('91') ? mobileClean : `91${mobileClean}`;
         // Template (2026-07-28): approved replacement for the old
         // azure_navia_test_u placeholder template, after two rounds of
         // rejection over OTP/login-flow content and numbered emoji
         // formatting -- final approved body has exactly one placeholder,
         // {{1}} = client name, and a static URL button (no runtime button
         // parameter needed, since the button has no {{}} of its own).
-        const waPayload = {
+        waPayload = {
             messaging_product: 'whatsapp',
             to: waNumber,
             type: 'template',
             template: {
-                name: 'new_navia_backup_022026',
+                name: templateName,
                 // 2026-08-20: Engati changed the approved template's
                 // language code from 'en' to 'en_US' on their side -- see
                 // the matching fix/comment in tradeNotify.js.
@@ -98,16 +133,49 @@ async function sendWhatsApp(mobile, clientName, ucc) {
             },
             body: JSON.stringify(waPayload)
         });
-        const waData = await waRes.json();
+        // Read as text first (same reasoning as tradeNotify.js) so a
+        // non-JSON/empty gateway error body doesn't surface as an opaque
+        // parse exception, and so the FULL raw response is always what
+        // gets persisted below -- not a re-serialized/lossy version of it.
+        const waRawBody = await waRes.text();
+        let waData;
+        try {
+            waData = waRawBody ? JSON.parse(waRawBody) : {};
+        } catch (parseErr) {
+            console.error(`WhatsApp non-JSON response for ${ucc}: HTTP ${waRes.status}, body: ${waRawBody.slice(0, 500) || '(empty)'}`);
+            await logWhatsAppAttempt(pool, {
+                source: 'ALERT_CLIENTS', ucc, commId, mobile: waNumber, templateName,
+                requestPayload: JSON.stringify(waPayload), httpStatus: waRes.status,
+                responseBody: waRawBody, success: false,
+                errorMessage: `Non-JSON response: HTTP ${waRes.status}`,
+            });
+            return { success: false, error: `Non-JSON response: HTTP ${waRes.status}` };
+        }
+
         if (waData.messages && waData.messages[0]?.id) {
             console.log(`WhatsApp sent to ${ucc} (${waNumber}): ${waData.messages[0].id}`);
+            await logWhatsAppAttempt(pool, {
+                source: 'ALERT_CLIENTS', ucc, commId, mobile: waNumber, templateName,
+                requestPayload: JSON.stringify(waPayload), httpStatus: waRes.status,
+                responseBody: waRawBody, messageId: waData.messages[0].id, success: true,
+            });
             return { success: true };
         } else {
             console.error(`WhatsApp failed for ${ucc}:`, JSON.stringify(waData));
+            await logWhatsAppAttempt(pool, {
+                source: 'ALERT_CLIENTS', ucc, commId, mobile: waNumber, templateName,
+                requestPayload: JSON.stringify(waPayload), httpStatus: waRes.status,
+                responseBody: waRawBody, success: false, errorMessage: 'No message id in response',
+            });
             return { success: false, error: JSON.stringify(waData) };
         }
     } catch (err) {
         console.error(`WhatsApp error for ${ucc}:`, err.message);
+        await logWhatsAppAttempt(pool, {
+            source: 'ALERT_CLIENTS', ucc, commId, mobile: waNumber || mobile,
+            templateName, requestPayload: waPayload ? JSON.stringify(waPayload) : null,
+            success: false, errorMessage: err.message,
+        });
         return { success: false, error: err.message };
     }
 }
@@ -240,10 +308,10 @@ async function withRetry(fn, { maxAttempts = 2, delayMs = 800 } = {}) {
     return { success: false, error: lastErr };
 }
 
-async function sendWhatsAppWithRetry(mobile, clientName, ucc, { maxAttempts = 2, delayMs = 800 } = {}) {
+async function sendWhatsAppWithRetry(pool, mobile, clientName, ucc, commId, { maxAttempts = 2, delayMs = 800 } = {}) {
     let last = { success: false, error: 'Not attempted' };
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        last = await sendWhatsApp(mobile, clientName, ucc);
+        last = await sendWhatsApp(pool, mobile, clientName, ucc, commId);
         if (last.success) return last;
         if (attempt < maxAttempts) await new Promise(r => setTimeout(r, delayMs));
     }
@@ -734,7 +802,7 @@ router.post('/communicate', adminAuthenticate, requireFullAdmin, async (req, res
             // ── Send WhatsApp (retried once on failure) ────────────────────
             if (client.needWa) {
                 attemptedAny = true;
-                const waResult = await sendWhatsAppWithRetry(client.mobile, client.client_name, client.ucc, { maxAttempts: 2, delayMs: 800 });
+                const waResult = await sendWhatsAppWithRetry(pool, client.mobile, client.client_name, client.ucc, commId, { maxAttempts: 2, delayMs: 800 });
                 if (waResult.success) {
                     whatsappStatus = 'SUCCESS'; whatsappSent++; succeededAny = true;
                 } else {
