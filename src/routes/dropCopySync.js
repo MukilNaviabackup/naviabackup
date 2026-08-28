@@ -248,8 +248,32 @@ router.post('/sync', validateSyncKey, async (req, res) => {
         });
 
     } catch (err) {
-        console.error('[DropCopy] Sync error:', err.message);
-        return res.status(500).json({ error: 'Sync failed: ' + err.message });
+        // 2026-08-28 fix: err.message alone was coming back EMPTY for
+        // whatever is currently breaking BSE CM's sync -- this is a known
+        // shape for some mssql driver errors (TVP validation failures,
+        // aggregate/timeout errors, RequestError from a stored-proc
+        // constraint violation) where the actual detail lives in other
+        // properties, not .message. Logging every property this error
+        // object might carry, plus a JSON dump as a catch-all, so the NEXT
+        // occurrence of this actually tells us something instead of a bare
+        // "[DropCopy] Sync error:" with nothing after it. Purely additive --
+        // the 500 response and its message shape to the caller are unchanged.
+        console.error('[DropCopy] Sync error for', file_source || `${exchange}/${segment}`, '- name:', err.name,
+            '| message:', err.message, '| code:', err.code, '| number:', err.number,
+            '| state:', err.state, '| class:', err.class);
+        if (err.originalError) {
+            console.error('[DropCopy] Sync error originalError:', err.originalError.message || JSON.stringify(err.originalError));
+        }
+        if (Array.isArray(err.errors) && err.errors.length) {
+            console.error('[DropCopy] Sync error aggregate errors:', err.errors.map(e => e.message || String(e)).join(' | '));
+        }
+        console.error('[DropCopy] Sync error stack:', err.stack);
+        try {
+            console.error('[DropCopy] Sync error full object:', JSON.stringify(err, Object.getOwnPropertyNames(err)));
+        } catch (stringifyErr) {
+            console.error('[DropCopy] Sync error could not be stringified:', stringifyErr.message);
+        }
+        return res.status(500).json({ error: 'Sync failed: ' + (err.message || err.name || 'Unknown error') });
     }
 });
 
