@@ -13,6 +13,29 @@ function validateSyncKey(req, res, next) {
     next();
 }
 
+// 2026-08-28 fix: every Decimal column in the TVP below is Decimal(10,4) --
+// max 6 integer digits (up to 999999.9999). Root-caused today via the
+// improved error logging: one BSE CM row's avg_sell_price (sell_value /
+// sell_qty) came out far larger than that, almost certainly from an
+// abnormally tiny sell_qty for that specific position -- and because a TVP
+// insert is all-or-nothing, that ONE bad row failed the entire batch of
+// 90-130 otherwise-good BSE CM positions, three times in a row (matching
+// the "HTTP 500 after 3 attempts" alert email). This guard nulls out any
+// value that wouldn't fit the column rather than letting the whole batch
+// fail, and logs which position triggered it so the underlying data
+// anomaly can still be investigated -- it does not change any value that
+// was already going to be valid.
+const MAX_DECIMAL_10_4 = 999999.9999;
+function sanitizeDecimal10_4(value, context) {
+    if (value === null || value === undefined) return null;
+    const n = Number(value);
+    if (!Number.isFinite(n) || Math.abs(n) > MAX_DECIMAL_10_4) {
+        console.warn(`[DropCopy] Out-of-range decimal value dropped (${context.field}=${value}) for ucc=${context.ucc} symbol=${context.symbol} -- nulled to avoid failing the whole batch. Investigate source data.`);
+        return null;
+    }
+    return n;
+}
+
 router.post('/sync', validateSyncKey, async (req, res) => {
     const { trades, positions: preAggPositions, trade_date, exchange, segment, file_source } = req.body;
 
@@ -156,9 +179,19 @@ router.post('/sync', validateSyncKey, async (req, res) => {
         tvp.columns.add('file_source',     sql.VarChar(50));
 
         for (const pos of positions) {
-            const netQty    = pos.net_qty        !== undefined ? pos.net_qty        : (pos.buy_qty - pos.sell_qty);
-            const avgBuyPx  = pos.avg_buy_price  !== undefined ? pos.avg_buy_price  : null;
-            const avgSellPx = pos.avg_sell_price !== undefined ? pos.avg_sell_price : null;
+            const ctx = { ucc: pos.ucc, symbol: pos.symbol };
+            const netQtyRaw    = pos.net_qty        !== undefined ? pos.net_qty        : (pos.buy_qty - pos.sell_qty);
+            const avgBuyPxRaw  = pos.avg_buy_price  !== undefined ? pos.avg_buy_price  : null;
+            const avgSellPxRaw = pos.avg_sell_price !== undefined ? pos.avg_sell_price : null;
+
+            // Every value below is Decimal(10,4) in the TVP -- sanitized so
+            // one out-of-range value can no longer fail the whole batch.
+            const buyQty    = sanitizeDecimal10_4(pos.buy_qty || 0, { ...ctx, field: 'buy_qty' })    ?? 0;
+            const sellQty   = sanitizeDecimal10_4(pos.sell_qty || 0, { ...ctx, field: 'sell_qty' })   ?? 0;
+            const netQty    = sanitizeDecimal10_4(netQtyRaw, { ...ctx, field: 'net_qty' })            ?? 0;
+            const avgBuyPx  = sanitizeDecimal10_4(avgBuyPxRaw,  { ...ctx, field: 'avg_buy_price' });
+            const avgSellPx = sanitizeDecimal10_4(avgSellPxRaw, { ...ctx, field: 'avg_sell_price' });
+            const strikePx  = sanitizeDecimal10_4(pos.strike_price || null, { ...ctx, field: 'strike_price' });
 
             tvp.rows.add(
                 (pos.ucc          || '').toString().substring(0, 20),
@@ -170,10 +203,10 @@ router.post('/sync', validateSyncKey, async (req, res) => {
                 (pos.bse_scrip_code || '').toString().substring(0, 20),
                 (pos.instrument_type || 'EQUITY').substring(0, 20),
                 pos.expiry_date ? new Date(pos.expiry_date) : null,
-                pos.strike_price  || null,
+                strikePx,
                 pos.option_type   || null,
-                pos.buy_qty       || 0,
-                pos.sell_qty      || 0,
+                buyQty,
+                sellQty,
                 netQty,
                 avgBuyPx,
                 avgSellPx,
@@ -248,32 +281,22 @@ router.post('/sync', validateSyncKey, async (req, res) => {
         });
 
     } catch (err) {
-        // 2026-08-28 fix: err.message alone was coming back EMPTY for
-        // whatever is currently breaking BSE CM's sync -- this is a known
-        // shape for some mssql driver errors (TVP validation failures,
-        // aggregate/timeout errors, RequestError from a stored-proc
-        // constraint violation) where the actual detail lives in other
-        // properties, not .message. Logging every property this error
-        // object might carry, plus a JSON dump as a catch-all, so the NEXT
-        // occurrence of this actually tells us something instead of a bare
-        // "[DropCopy] Sync error:" with nothing after it. Purely additive --
-        // the 500 response and its message shape to the caller are unchanged.
-        console.error('[DropCopy] Sync error for', file_source || `${exchange}/${segment}`, '- name:', err.name,
-            '| message:', err.message, '| code:', err.code, '| number:', err.number,
-            '| state:', err.state, '| class:', err.class);
-        if (err.originalError) {
-            console.error('[DropCopy] Sync error originalError:', err.originalError.message || JSON.stringify(err.originalError));
-        }
-        if (Array.isArray(err.errors) && err.errors.length) {
-            console.error('[DropCopy] Sync error aggregate errors:', err.errors.map(e => e.message || String(e)).join(' | '));
-        }
-        console.error('[DropCopy] Sync error stack:', err.stack);
-        try {
-            console.error('[DropCopy] Sync error full object:', JSON.stringify(err, Object.getOwnPropertyNames(err)));
-        } catch (stringifyErr) {
-            console.error('[DropCopy] Sync error could not be stringified:', stringifyErr.message);
-        }
-        return res.status(500).json({ error: 'Sync failed: ' + (err.message || err.name || 'Unknown error') });
+        // 2026-08-28 fix (v2, trimmed down after first use): err.message
+        // alone can come back EMPTY for some mssql RequestError shapes --
+        // the actual SQL Server error text lives in err.precedingErrors[].
+        // First version of this logged the entire nested error object,
+        // which worked (found the root cause -- a TVP decimal-precision
+        // overflow) but was extremely noisy, repeating the same stack
+        // traces on every retry. Trimmed to just the useful summary line(s).
+        const precedingMsgs = Array.isArray(err.precedingErrors)
+            ? err.precedingErrors.map(e => e.message).filter(Boolean)
+            : [];
+        console.error(
+            `[DropCopy] Sync error for ${file_source || `${exchange}/${segment}`} - ` +
+            `name: ${err.name} | code: ${err.code}` +
+            (precedingMsgs.length ? ` | detail: ${precedingMsgs.join(' || ')}` : (err.message ? ` | message: ${err.message}` : ' | (no message available)'))
+        );
+        return res.status(500).json({ error: 'Sync failed: ' + (precedingMsgs[0] || err.message || err.name || 'Unknown error') });
     }
 });
 
