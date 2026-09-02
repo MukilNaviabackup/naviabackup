@@ -4,7 +4,6 @@ const router       = express.Router();
 const { getConnection, sql } = require('../config/database');
 const authenticate           = require('../middleware/authenticate');
 require('dotenv').config();
-
 function validateSyncKey(req, res, next) {
     const key = req.headers['x-sync-key'] || req.body?.sync_key;
     if (!key || key !== process.env.SYNC_API_KEY) {
@@ -14,8 +13,8 @@ function validateSyncKey(req, res, next) {
 }
 
 // 2026-08-28 fix: every Decimal column in the TVP below is Decimal(10,4) --
-// max 6 integer digits (up to 999999.9999). Root-caused today via the
-// improved error logging: one BSE CM row's avg_sell_price (sell_value /
+// max 6 integer digits (up to 999999.9999). Root-caused via improved error
+// logging on the BSE CM feed: one row's avg_sell_price (sell_value /
 // sell_qty) came out far larger than that, almost certainly from an
 // abnormally tiny sell_qty for that specific position -- and because a TVP
 // insert is all-or-nothing, that ONE bad row failed the entire batch of
@@ -24,10 +23,11 @@ function validateSyncKey(req, res, next) {
 // value that wouldn't fit the column rather than letting the whole batch
 // fail, and logs which position triggered it so the underlying data
 // anomaly can still be investigated -- it does not change any value that
-// was already going to be valid.
+// was already going to be valid, so existing good rows behave identically
+// to before.
 const MAX_DECIMAL_10_4 = 999999.9999;
 function sanitizeDecimal10_4(value, context) {
-    if (value === null || value === undefined) return null;
+    if (value === null || value === undefined || value === '') return null;
     const n = Number(value);
     if (!Number.isFinite(n) || Math.abs(n) > MAX_DECIMAL_10_4) {
         console.warn(`[DropCopy] Out-of-range decimal value dropped (${context.field}=${value}) for ucc=${context.ucc} symbol=${context.symbol} -- nulled to avoid failing the whole batch. Investigate source data.`);
@@ -38,21 +38,17 @@ function sanitizeDecimal10_4(value, context) {
 
 router.post('/sync', validateSyncKey, async (req, res) => {
     const { trades, positions: preAggPositions, trade_date, exchange, segment, file_source } = req.body;
-
     const hasPositions = preAggPositions && Array.isArray(preAggPositions) && preAggPositions.length > 0;
     const hasTrades    = trades && Array.isArray(trades) && trades.length > 0;
-
     if (!hasPositions && !hasTrades) {
         return res.status(400).json({ error: 'No trades or positions provided.' });
     }
     if (!trade_date || !exchange || !segment) {
         return res.status(400).json({ error: 'trade_date, exchange and segment are required.' });
     }
-
     try {
         const pool      = await getConnection();
         let   positions = [];
-
         if (hasPositions) {
             positions = preAggPositions;
         } else {
@@ -79,7 +75,6 @@ router.post('/sync', validateSyncKey, async (req, res) => {
             // sync batch is not a realistic scenario for this platform.
             const seenTradeKeys = new Set();
             let duplicatesSkipped = 0;
-
             const positionMap = new Map();
             for (const trade of trades) {
                 const { ucc, symbol, isin, company_name, instrument_type,
@@ -92,7 +87,6 @@ router.post('/sync', validateSyncKey, async (req, res) => {
                 const px  = parseFloat(price)    || 0;
                 const lot = parseInt(lot_size)   || 1;
                 if (qty <= 0) continue;
-
                 const tradeUtid = unq_trad_idr || unqTradIdr || UnqTradIdr || null;
                 const tradeOref = ordr_ref     || ordrRef     || OrdrRef     || null;
                 // FIX (07-Jul-2026): include symbol in the UTID-branch key too --
@@ -110,7 +104,6 @@ router.post('/sync', validateSyncKey, async (req, res) => {
                     continue;
                 }
                 seenTradeKeys.add(dedupeKey);
-
                 const lotQty = lot > 0 ? qty / lot : qty;
                 const isBuy  = side.toUpperCase() === 'B';
                 const key    = `${ucc}|${symbol.trim()}|${expiry_date||''}|${strike_price||''}|${option_type||''}`;
@@ -135,7 +128,6 @@ router.post('/sync', validateSyncKey, async (req, res) => {
             if (duplicatesSkipped > 0) {
                 console.log(`[DropCopy] Skipped ${duplicatesSkipped} duplicate trade row(s) (exact repeat within this sync batch)`);
             }
-
             for (const pos of positionMap.values()) {
                 positions.push({
                     ucc:             pos.ucc,
@@ -155,7 +147,6 @@ router.post('/sync', validateSyncKey, async (req, res) => {
                 });
             }
         }
-
         // ── Build TVP — now includes isin + company_name ──────────────────────
         const tvp = new sql.Table();
         tvp.columns.add('ucc',             sql.VarChar(20));
@@ -177,15 +168,16 @@ router.post('/sync', validateSyncKey, async (req, res) => {
         tvp.columns.add('lot_size',        sql.Int);
         tvp.columns.add('trade_date',      sql.Date);
         tvp.columns.add('file_source',     sql.VarChar(50));
-
         for (const pos of positions) {
+            // 2026-08-28 fix: sanitize every Decimal(10,4) field before adding
+            // the row -- see sanitizeDecimal10_4() above. Nothing else about
+            // this row-building logic changed; a row that was already valid
+            // produces the exact same values as before.
             const ctx = { ucc: pos.ucc, symbol: pos.symbol };
             const netQtyRaw    = pos.net_qty        !== undefined ? pos.net_qty        : (pos.buy_qty - pos.sell_qty);
             const avgBuyPxRaw  = pos.avg_buy_price  !== undefined ? pos.avg_buy_price  : null;
             const avgSellPxRaw = pos.avg_sell_price !== undefined ? pos.avg_sell_price : null;
 
-            // Every value below is Decimal(10,4) in the TVP -- sanitized so
-            // one out-of-range value can no longer fail the whole batch.
             const buyQty    = sanitizeDecimal10_4(pos.buy_qty || 0, { ...ctx, field: 'buy_qty' })    ?? 0;
             const sellQty   = sanitizeDecimal10_4(pos.sell_qty || 0, { ...ctx, field: 'sell_qty' })   ?? 0;
             const netQty    = sanitizeDecimal10_4(netQtyRaw, { ...ctx, field: 'net_qty' })            ?? 0;
@@ -215,20 +207,16 @@ router.post('/sync', validateSyncKey, async (req, res) => {
                 file_source       || ''
             );
         }
-
         // ── Bulk upsert day_positions ─────────────────────────────────────────
         await pool.request()
             .input('positions', tvp)
             .execute('usp_BulkUpsertDayPositions');
-
         console.log(`[DropCopy] ${file_source} - ${positions.length} positions bulk upserted`);
-
         // ── Batch upsert symbol_master via TVP (single SQL call) ────────────
         const cmPositions = positions.filter(p =>
             (p.isin || '').length > 5 &&
             (p.instrument_type || '').toUpperCase() === 'EQUITY'
         );
-
         if (cmPositions.length > 0) {
             try {
                 // Deduplicate by ISIN — MERGE fails if source has duplicate ON-clause keys
@@ -239,7 +227,6 @@ router.post('/sync', validateSyncKey, async (req, res) => {
                     }
                 }
                 const uniquePositions = Array.from(isinMap.values());
-
                 // Batch in chunks of 200 (200 × 4 params = 800, safely under 2100 limit)
                 const CHUNK = 200;
                 for (let ci = 0; ci < uniquePositions.length; ci += CHUNK) {
@@ -271,7 +258,6 @@ router.post('/sync', validateSyncKey, async (req, res) => {
                 console.error('[DropCopy] symbol_master batch upsert error:', smErr.message);
             }
         }
-
         return res.json({
             success:  true,
             inserted: positions.length,
@@ -279,15 +265,11 @@ router.post('/sync', validateSyncKey, async (req, res) => {
             skipped:  0,
             total:    positions.length
         });
-
     } catch (err) {
-        // 2026-08-28 fix (v2, trimmed down after first use): err.message
-        // alone can come back EMPTY for some mssql RequestError shapes --
-        // the actual SQL Server error text lives in err.precedingErrors[].
-        // First version of this logged the entire nested error object,
-        // which worked (found the root cause -- a TVP decimal-precision
-        // overflow) but was extremely noisy, repeating the same stack
-        // traces on every retry. Trimmed to just the useful summary line(s).
+        // 2026-08-28 fix: err.message alone can come back EMPTY for some
+        // mssql RequestError shapes -- the actual SQL Server error text
+        // lives in err.precedingErrors[]. Surface that, plus name/code, in
+        // one concise line instead of a bare (and often blank) err.message.
         const precedingMsgs = Array.isArray(err.precedingErrors)
             ? err.precedingErrors.map(e => e.message).filter(Boolean)
             : [];
@@ -299,17 +281,14 @@ router.post('/sync', validateSyncKey, async (req, res) => {
         return res.status(500).json({ error: 'Sync failed: ' + (precedingMsgs[0] || err.message || err.name || 'Unknown error') });
     }
 });
-
 router.get('/positions', authenticate, async (req, res) => {
     try {
         const pool = await getConnection();
         const ucc  = req.user && req.user.ucc;
         if (!ucc) return res.status(401).json({ error: 'Unauthorized.' });
-
         const now       = new Date();
         const istDate   = new Date(now.getTime() + (5.5 * 60 * 60 * 1000));
         const tradeDate = istDate.toISOString().slice(0, 10);
-
         const result = await pool.request()
             .input('ucc',       sql.VarChar(20), ucc.toString().trim())
             .input('tradeDate', sql.Date,        new Date(tradeDate))
@@ -323,7 +302,6 @@ router.get('/positions', authenticate, async (req, res) => {
                 WHERE ucc = @ucc AND trade_date = @tradeDate
                 ORDER BY instrument_type, symbol
             `);
-
         return res.json({
             success:    true,
             positions:  result.recordset,
@@ -335,7 +313,6 @@ router.get('/positions', authenticate, async (req, res) => {
         return res.status(500).json({ error: 'Failed to fetch day positions.' });
     }
 });
-
 router.get('/status', async (req, res) => {
     try {
         const pool   = await getConnection();
@@ -354,7 +331,6 @@ router.get('/status', async (req, res) => {
         return res.status(500).json({ error: 'Failed to fetch status.' });
     }
 });
-
 router.post('/log', validateSyncKey, async (req, res) => {
     const { file_source, exchange, segment, status, trades_count,
             positions_count, sync_duration_ms, error_message,
@@ -388,7 +364,6 @@ router.post('/log', validateSyncKey, async (req, res) => {
         return res.status(500).json({ error: err.message });
     }
 });
-
 router.get('/sync-logs', async (req, res) => {
     // Accept either the server-side sync key (used by Python services)
     // OR a valid admin JWT Bearer token (used by the SyncMonitor admin panel).
@@ -396,7 +371,6 @@ router.get('/sync-logs', async (req, res) => {
     // authenticates with its normal JWT instead.
     const key = req.headers['x-sync-key'] || req.query.key;
     let isAuthorized = key && key === process.env.SYNC_API_KEY;
-
     if (!isAuthorized) {
         const authHeader = req.headers['authorization'];
         const token = authHeader && authHeader.split(' ')[1];
@@ -408,13 +382,11 @@ router.get('/sync-logs', async (req, res) => {
             } catch (_) {}
         }
     }
-
     if (!isAuthorized) {
         return res.status(401).json({ error: 'Unauthorized.' });
     }
     try {
         const pool = await getConnection();
-
         // FIX (16-Jul-2026): this route used to be a flat "SELECT TOP 200 ...
         // ORDER BY log_time DESC" with no pagination, and the frontend derived
         // its Total/Success/Error counts from that same capped 200-row array.
@@ -430,7 +402,6 @@ router.get('/sync-logs', async (req, res) => {
         const page   = parseInt(req.query.page)  || 1;
         const limit  = parseInt(req.query.limit) || 200;
         const offset = (page - 1) * limit;
-
         // Build the WHERE filters once, reused identically by both queries
         // below so the summary counts always match what the page is filtered to.
         const filters = [];
@@ -439,7 +410,6 @@ router.get('/sync-logs', async (req, res) => {
         if (req.query.exchange && req.query.exchange !== 'ALL') filters.push({ clause: ' AND exchange = @exchange', name: 'exchange', type: sql.VarChar(10), val: req.query.exchange });
         if (req.query.status   && req.query.status   !== 'ALL') filters.push({ clause: ' AND status = @status',    name: 'status',   type: sql.VarChar(20), val: req.query.status   });
         const whereClause = ' WHERE 1=1' + filters.map(f => f.clause).join('');
-
         // ── Paginated rows for the table ───────────────────────────────────
         const rowsReq = pool.request();
         filters.forEach(f => rowsReq.input(f.name, f.type, f.val));
@@ -456,7 +426,6 @@ router.get('/sync-logs', async (req, res) => {
             ORDER BY log_time DESC
             OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY
         `);
-
         // ── True totals across the WHOLE filtered range, not just this page ─
         const countReq = pool.request();
         filters.forEach(f => countReq.input(f.name, f.type, f.val));
@@ -471,7 +440,6 @@ router.get('/sync-logs', async (req, res) => {
         `);
         const counts = countResult.recordset[0] || {};
         const total  = counts.total || 0;
-
         return res.json({
             success: true,
             logs:    rowsResult.recordset,
@@ -493,7 +461,6 @@ router.get('/sync-logs', async (req, res) => {
         return res.status(500).json({ error: err.message });
     }
 });
-
 router.post('/refresh-lots', async (req, res) => {
     const key = req.headers['x-sync-key'] || req.query.key;
     if (!key || key !== process.env.SYNC_API_KEY)
@@ -523,5 +490,4 @@ router.post('/refresh-lots', async (req, res) => {
         return res.status(500).json({ error: err.message });
     }
 });
-
 module.exports = router;
