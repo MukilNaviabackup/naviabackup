@@ -144,6 +144,27 @@ function buildExchangeHeaderIndex(headerLine) {
     return idx;
 }
 
+// FIX (08-Sep-2026): NSE Clearing's own Position_NCL_FO_*.csv file is not
+// exchange-pure -- confirmed against the live 07-Sep-2026 file, which
+// carries SENSEX and BANKEX (BSE-listed index F&O, cross-cleared through
+// NCL under the exchanges' clearing interoperability arrangement) mixed in
+// with genuine NSE index/stock contracts, with NO per-row column
+// distinguishing them (Sgmt="FO" and Src="NCL" are identical for every row
+// in the file, regardless of the true listing exchange). Before this fix,
+// every row from this file was force-tagged with the filename-derived
+// fmt.exchange ("NSE"), so SENSEX/BANKEX rows were silently mislabeled NSE
+// instead of BSE (confirmed: 113 SENSEX rows wrongly tagged NSE for
+// 08-Sep-2026 in bf_positions). This mirrors the already-correct per-row
+// exchange logic parseSymphonyRow() already applies below for the Symphony
+// file format, adapted here to a file with no explicit per-row exchange
+// column -- keyed on the one signal this file does carry: the symbol
+// itself. Any symbol NOT in this list keeps the exact same fmt.exchange
+// default as before, so this cannot change a single already-correct row.
+const BSE_INDEX_SYMBOLS = new Set(['SENSEX', 'BANKEX']);
+function resolveExchangeFormatRowExchange(symbol, defaultExchange) {
+    return BSE_INDEX_SYMBOLS.has((symbol || '').toUpperCase()) ? 'BSE' : defaultExchange;
+}
+
 // Navia Backup B/F formula (confirmed 2026-07-27): the carry-forward figure
 // comes from PreExrcAssgndLngQty / PreExrcAssgndShrtQty -- NOT the opening or
 // same-day trading qty columns elsewhere in the file. Exactly one side should
@@ -419,11 +440,24 @@ router.post('/upload', adminAuthenticate, upload.single('bf_file'), async (req, 
 
             const headerIdx = buildExchangeHeaderIndex(lines[0]);
 
+            // FIX (08-Sep-2026): dropped the "AND exchange = @exchange"
+            // condition this DELETE used to have. Now that a single NCL_FO
+            // file can legitimately produce both 'NSE' and 'BSE' rows (see
+            // resolveExchangeFormatRowExchange() above), a same-day
+            // re-upload only clearing exchange = fmt.exchange ('NSE') would
+            // leave that day's already-correct BSE (SENSEX/BANKEX) rows
+            // behind, and the fresh insert would duplicate them instead of
+            // replacing them. file_source is already unique to this exact
+            // file/parser (NCL_FO or MCXCCL_CO), so scoping by
+            // file_source + biz_date alone is still just as safe -- it
+            // still cannot touch a Symphony-sourced row or the other
+            // exchange-format file's rows for the same day, and for
+            // MCXCCL_CO (which never produces a non-MCX row) this is a
+            // no-op simplification with no behaviour change at all.
             await pool.request()
-                .input('exchange',  sql.VarChar(10), fmt.exchange)
                 .input('bizDate',   sql.Date, new Date(bizDate))
                 .input('fileSrc',   sql.VarChar(20), fmt.source)
-                .query('DELETE FROM bf_positions WHERE exchange = @exchange AND biz_date = @bizDate AND file_source = @fileSrc');
+                .query('DELETE FROM bf_positions WHERE biz_date = @bizDate AND file_source = @fileSrc');
 
             // Read every remaining row -- no truncation, however many
             // thousand lines the exchange file contains.
@@ -437,7 +471,9 @@ router.post('/upload', adminAuthenticate, upload.single('bf_file'), async (req, 
 
                 rowsToInsert.push({
                     ucc:          row.ucc,
-                    exchange:     fmt.exchange,
+                    // FIX (08-Sep-2026): was fmt.exchange unconditionally --
+                    // see resolveExchangeFormatRowExchange() above for why.
+                    exchange:     resolveExchangeFormatRowExchange(row.symbol, fmt.exchange),
                     segment:      fmt.segment,
                     symbol:       row.symbol,
                     expiryDate:   row.expiry,
